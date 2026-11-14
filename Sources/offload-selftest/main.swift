@@ -138,6 +138,59 @@ run8.onPhase = { phases8.append($0) }; run8.onSSDVerified = { _ in ssdCalled = t
 let r8 = run8.run()
 check(phases8 == [.copyingBackups, .verifyingBackups, .done] && !ssdCalled && r8.verdict.isSafe, "no SSD: skips straight to backups, still safe")
 
+// MARK: - Lightroom catalog (never launches Lightroom: `open` is injected)
+print("\n--- lightroom")
+let lr = scratch.appendingPathComponent("lightroom")
+try? fm.removeItem(at: lr)
+try! fm.createDirectory(at: lr, withIntermediateDirectories: true)
+func sqliteDB(_ name: String, rows: Int, table: Bool = true) -> URL {
+    let u = lr.appendingPathComponent(name)
+    let sql = (table ? "CREATE TABLE AgLibraryFile(id_local INTEGER PRIMARY KEY, baseName TEXT);" : "CREATE TABLE Other(x);")
+        + (0..<rows).map { "INSERT INTO AgLibraryFile(baseName) VALUES('DSC\($0)');" }.joined()
+    shell("/usr/bin/sqlite3", u.path, sql)
+    return u
+}
+check(Naming.baseName("2026-11", "bears ears") == "import-2026-11-bears-ears"
+      && Naming.photoFolder("2026-11", "bears ears") == Naming.baseName("2026-11", "bears ears"), "baseName is the import folder name")
+let cats = lr.appendingPathComponent("Catalogs")
+let catURL = Lightroom.catalogURL(base: Naming.baseName("2026-11", "bears ears"), catalogsFolder: cats)
+check(catURL.path.hasSuffix("Catalogs/import-2026-11-bears-ears/import-2026-11-bears-ears.lrcat"), "catalog path <folder>/<base>/<base>.lrcat")
+
+let emptyT = sqliteDB("Empty.lrcat", rows: 0)
+check(Lightroom.validateTemplate(emptyT) == .ok, "template: empty catalog -> ok")
+check(Lightroom.validateTemplate(sqliteDB("Full.lrcat", rows: 3)) == .notEmpty(3), "template: 3 photos -> notEmpty(3)")
+let lockedT = sqliteDB("Locked.lrcat", rows: 0)
+try! Data().write(to: URL(fileURLWithPath: lockedT.path + ".lock"))
+check(Lightroom.validateTemplate(lockedT) == .locked, "template: .lock present -> locked")
+let txt = lr.appendingPathComponent("Text.lrcat"); try! Data("hello".utf8).write(to: txt)
+check(Lightroom.validateTemplate(txt) == .notSQLite, "template: not SQLite -> rejected")
+if case .unreadable = Lightroom.validateTemplate(sqliteDB("NoTable.lrcat", rows: 0, table: false)) { check(true, "template: SQLite without AgLibraryFile -> rejected") }
+else { check(false, "template: SQLite without AgLibraryFile -> rejected") }
+check(Lightroom.validateTemplate(lr.appendingPathComponent("x.sqlite")) == .notLrcat, "template: wrong extension -> rejected")
+let beforeHash = try! Updater.sha256(of: emptyT)
+check(try! Updater.sha256(of: emptyT) == beforeHash && !fm.fileExists(atPath: emptyT.path + "-journal"), "validation left the template untouched")
+
+// Decoys next to the template must NOT be copied.
+for d in ["Empty.lrcat-wal", "Empty.lrcat-shm"] { try! Data("decoy".utf8).write(to: lr.appendingPathComponent(d)) }
+for d in ["Empty.lrcat-data", "Empty Previews.lrdata", "Empty Helper.lrdata"] {
+    try! fm.createDirectory(at: lr.appendingPathComponent(d), withIntermediateDirectories: true)
+    try! Data("decoy".utf8).write(to: lr.appendingPathComponent(d).appendingPathComponent("x"))
+}
+var opened: [URL] = []
+let res = try? Lightroom.createAndOpen(template: emptyT, catalog: catURL, open: { opened.append($0) })
+let contents = (try? fm.contentsOfDirectory(atPath: catURL.deletingLastPathComponent().path)) ?? []
+check(res == .created(catURL) && contents == ["import-2026-11-bears-ears.lrcat"], "creates catalog, copying ONLY the .lrcat (\(contents))")
+check((try? Updater.sha256(of: catURL)) == beforeHash && opened == [catURL], "catalog is a byte copy of the template, then opened")
+
+try! Data("user's edits".utf8).write(to: catURL)    // pretend the user has been working in it
+let res2 = try? Lightroom.createAndOpen(template: emptyT, catalog: catURL, open: { opened.append($0) })
+check(res2 == .existing(catURL) && (try? String(contentsOf: catURL, encoding: .utf8)) == "user's edits" && opened.count == 2,
+      "existing catalog is opened, never overwritten")
+do {
+    try Lightroom.createAndOpen(template: lockedT, catalog: Lightroom.catalogURL(base: "import-2026-11-x", catalogsFolder: cats), open: { opened.append($0) })
+    check(false, "locked template refused")
+} catch { check(opened.count == 2 && !fm.fileExists(atPath: cats.appendingPathComponent("import-2026-11-x").path), "locked template refused, nothing created/opened: \(error.localizedDescription)") }
+
 // MARK: - Updater (offline)
 print("\n--- updater")
 func v(_ s: String) -> SemVer { SemVer(s)! }

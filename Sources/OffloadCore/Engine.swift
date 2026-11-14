@@ -13,7 +13,9 @@ public enum Naming {
         return String(format: "%04d-%02d", c.year!, c.month!)
     }
     public static func isValidMonth(_ m: String) -> Bool { m.range(of: #"^\d{4}-(0[1-9]|1[0-2])$"#, options: .regularExpression) != nil }
-    public static func photoFolder(_ month: String, _ desc: String) -> String { "import-\(month)-\(slug(desc))" }
+    /// Single source for the import's name: SSD/backup folder and Lightroom catalog both use it.
+    public static func baseName(_ month: String, _ desc: String) -> String { "import-\(month)-\(slug(desc))" }
+    public static func photoFolder(_ month: String, _ desc: String) -> String { baseName(month, desc) }
     public static func videoFolder(_ month: String, _ desc: String) -> String { "video/\(month)-\(slug(desc))" }
 }
 

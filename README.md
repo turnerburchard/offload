@@ -35,6 +35,17 @@ Other guard rails:
 
 Offload never deletes or formats anything. Wiping the card is up to you.
 
+## Lightroom catalog (optional)
+
+Once the SSD copy is verified, the green **Ready for Lightroom** section has a **Create catalog & open in Lightroom** button.
+
+- **One-time setup:** in Lightroom Classic, choose **File > New Catalog** to make an empty catalog, then quit Lightroom. In Offload's Settings, pick that file as the *Lightroom template catalog*. You can also choose a *Catalogs folder* (default `~/Pictures`).
+- **Template check:** Offload checks the template read-only, on a temporary copy. It must be an SQLite catalog with no photos, and must not be open in Lightroom (no `.lock` file next to it).
+- **What the button does:** it copies **only** the template `.lrcat` file to `<Catalogs folder>/<import name>/<import name>.lrcat`, using the same name as the SSD folder (e.g. `import-2026-11-bears-ears`). It then opens the new catalog in Lightroom Classic. If that catalog already exists, it is opened and never overwritten.
+- **Then, in Lightroom:** Import → select the SSD folder → turn on **Include Subfolders** → choose **Add** (not Copy or Move).
+
+Offload never writes to a catalog database. There is no Lightroom plugin.
+
 ## Install
 
 1. Download `Offload-x.y.z.zip` from [Releases](../../releases) and unzip it.
