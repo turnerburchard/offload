@@ -45,6 +45,9 @@ public enum Card {
     /// Every regular file rsync will copy: everything except AppleDouble `._*` (matches `--exclude='._*'`).
     /// Listing errors are collected, never swallowed: an unlisted folder must not be declared "safe".
     static func walk(_ dir: URL, _ errors: inout [String]) -> [(rel: String, size: Int64, url: URL)] {
+        // The enumerator yields realpath'd URLs (/var -> /private/var), so resolve `dir` the same way or `depth` is off.
+        // (URL.resolvingSymlinksInPath() can't be used: it strips /private, going the other way.)
+        let dir = realpath(dir.path, nil).map { p in defer { free(p) }; return URL(fileURLWithPath: String(cString: p), isDirectory: true) } ?? dir
         guard FileManager.default.fileExists(atPath: dir.path) else { return [] }
         var errs: [String] = []
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey]
