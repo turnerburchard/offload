@@ -50,7 +50,7 @@ Offload never writes to a catalog database. There is no Lightroom plugin.
 
 1. Download `Offload-x.y.z.zip` from [Releases](../../releases) and unzip it.
 2. Move `Offload.app` to `/Applications`.
-3. **First launch:** the app has an ad-hoc signature rather than a Developer ID, so macOS will block a normal double-click. **Right-click Offload.app → Open → Open.** (On macOS 15 you may need **System Settings → Privacy & Security → Open Anyway**.) You only need to do this once.
+3. **First launch:** the app is signed with a self-signed certificate rather than an Apple Developer ID and isn't notarized, so macOS will block a normal double-click. **Right-click Offload.app → Open → Open.** (On macOS 15 you may need **System Settings → Privacy & Security → Open Anyway**.) You only need to do this once.
 4. Allow access to removable volumes when asked.
 
 ### Updates
