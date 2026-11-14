@@ -6,8 +6,11 @@ import Updater
 
 let args = CommandLine.arguments
 let fm = FileManager.default
-let scratch = args.count >= 2 ? URL(fileURLWithPath: args[1])
+let scratchArg = args.count >= 2 ? URL(fileURLWithPath: args[1])
     : fm.temporaryDirectory.appendingPathComponent("offload-selftest-\(UUID().uuidString.prefix(8))")
+try! fm.createDirectory(at: scratchArg, withIntermediateDirectories: true)
+// Resolve symlinks (/var -> /private/var) so URLs built here compare equal to ones found by directory scans.
+let scratch = realpath(scratchArg.path, nil).map { p in defer { free(p) }; return URL(fileURLWithPath: String(cString: p), isDirectory: true) } ?? scratchArg
 print("scratch: \(scratch.path)")
 let root = scratch.appendingPathComponent("Volumes")
 try? fm.removeItem(at: root)
