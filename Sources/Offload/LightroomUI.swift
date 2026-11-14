@@ -1,20 +1,8 @@
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 import OffloadCore
 
 extension AppModel {
-    /// Optional override (Settings) else auto-discovery in the catalogs folder; re-run on every click.
-    func revalidateTemplate() { templateDiscovery = Lightroom.discoverTemplate(in: catalogsFolder, override: lrTemplate) }
-
-    func chooseTemplate() {
-        let p = NSOpenPanel()
-        p.message = "Choose an EMPTY Lightroom catalog (make one with File > New Catalog)"
-        p.allowedContentTypes = [UTType(filenameExtension: "lrcat") ?? .data]
-        p.treatsFilePackagesAsDirectories = true
-        if p.runModal() == .OK, let u = p.url { lrTemplate = u }
-    }
-
     func chooseCatalogsFolder() {
         let p = NSOpenPanel()
         p.canChooseFiles = false; p.canChooseDirectories = true; p.canCreateDirectories = true
@@ -23,9 +11,8 @@ extension AppModel {
     }
 
     func createCatalog(ssdFolder: URL) {
-        revalidateTemplate()
-        guard let template = templateDiscovery?.template else {
-            catalogMessage = templateDiscovery?.problem
+        guard let template = Bundle.main.url(forResource: "EmptyCatalog", withExtension: "lrcat") else {
+            catalogMessage = "This copy of Offload is missing its empty catalog. Reinstall it from GitHub Releases."
             return
         }
         // Same base name as the SSD import folder.
@@ -62,17 +49,6 @@ struct LightroomSettingsSection: View {
     @EnvironmentObject var m: AppModel
     var body: some View {
         Section {
-            LabeledContent("Template catalog") {
-                HStack {
-                    Text(m.lrTemplate == nil ? "Automatic" : m.lrTemplate!.lastPathComponent).foregroundStyle(.secondary)
-                    if m.lrTemplate != nil { Button("Use automatic") { m.lrTemplate = nil } }
-                    Button("Choose…") { m.chooseTemplate() }
-                }
-            }
-            if let d = m.templateDiscovery {
-                if let t = d.template { Label("Using \(t.path)", systemImage: "checkmark.circle").foregroundStyle(.green) }
-                else if let p = d.problem { Label(p, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
-            }
             LabeledContent("Catalogs folder") {
                 HStack {
                     Text(m.catalogsFolder.path).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -80,9 +56,7 @@ struct LightroomSettingsSection: View {
                 }
             }
         } header: { Text("Lightroom") } footer: {
-            Text("New catalogs are copies of an empty template catalog, created at <Catalogs folder>/<import name>/<import name>.lrcat. The template is found automatically: <Catalogs folder>/template/template.lrcat, or any .lrcat with “template” in its name. Make it once in Lightroom Classic with File > New Catalog.")
-                .foregroundStyle(.secondary)
+            Text("Each import gets its own catalog: <folder>/<import name>/<import name>.lrcat.").foregroundStyle(.secondary)
         }
-        .onAppear { m.revalidateTemplate() }
     }
 }

@@ -159,68 +159,27 @@ let cats = lr.appendingPathComponent("Catalogs")
 let catURL = Lightroom.catalogURL(base: Naming.baseName("2026-11", "bears ears"), catalogsFolder: cats)
 check(catURL.path.hasSuffix("Catalogs/import-2026-11-bears-ears/import-2026-11-bears-ears.lrcat"), "catalog path <folder>/<base>/<base>.lrcat")
 
-let emptyT = sqliteDB("Empty.lrcat", rows: 0)
-check(Lightroom.validateTemplate(emptyT) == .ok, "template: empty catalog -> ok")
-check(Lightroom.validateTemplate(sqliteDB("Full.lrcat", rows: 3)) == .notEmpty(3), "template: 3 photos -> notEmpty(3)")
-let lockedT = sqliteDB("Locked.lrcat", rows: 0)
-try! Data().write(to: URL(fileURLWithPath: lockedT.path + ".lock"))
-check(Lightroom.validateTemplate(lockedT) == .locked, "template: .lock present -> locked")
-let txt = lr.appendingPathComponent("Text.lrcat"); try! Data("hello".utf8).write(to: txt)
-check(Lightroom.validateTemplate(txt) == .notSQLite, "template: not SQLite -> rejected")
-if case .unreadable = Lightroom.validateTemplate(sqliteDB("NoTable.lrcat", rows: 0, table: false)) { check(true, "template: SQLite without AgLibraryFile -> rejected") }
-else { check(false, "template: SQLite without AgLibraryFile -> rejected") }
-check(Lightroom.validateTemplate(lr.appendingPathComponent("x.sqlite")) == .notLrcat, "template: wrong extension -> rejected")
-let beforeHash = try! Updater.sha256(of: emptyT)
-check(try! Updater.sha256(of: emptyT) == beforeHash && !fm.fileExists(atPath: emptyT.path + "-journal"), "validation left the template untouched")
+let emptyT = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()   // .build/<config>/
+    .appendingPathComponent("../../Resources/EmptyCatalog.lrcat").standardizedFileURL
+let bundled = emptyT
+check(fm.fileExists(atPath: bundled.path), "Resources/EmptyCatalog.lrcat exists (\(bundled.path))")
+let photos = capture("/usr/bin/sqlite3", "-readonly", bundled.path, "SELECT COUNT(*) FROM AgLibraryFile;")
+check(photos.trimmingCharacters(in: .whitespacesAndNewlines) == "0", "bundled template is an empty catalog (\(bundled.lastPathComponent))")
+let leaked = capture("/usr/bin/sqlite3", "-readonly", bundled.path,
+    "SELECT COUNT(*) FROM Adobe_variablesTable WHERE name IN ('Adobe_identityPlate','Adobe_lastScannedCatalogPath') OR value LIKE '%/Users/%';")
+check(leaked.trimmingCharacters(in: .whitespacesAndNewlines) == "0", "bundled template has no user paths or identity plate")
+let beforeHash = try! Updater.sha256(of: bundled)
 
-// Decoys next to the template must NOT be copied.
-for d in ["Empty.lrcat-wal", "Empty.lrcat-shm"] { try! Data("decoy".utf8).write(to: lr.appendingPathComponent(d)) }
-for d in ["Empty.lrcat-data", "Empty Previews.lrdata", "Empty Helper.lrdata"] {
-    try! fm.createDirectory(at: lr.appendingPathComponent(d), withIntermediateDirectories: true)
-    try! Data("decoy".utf8).write(to: lr.appendingPathComponent(d).appendingPathComponent("x"))
-}
 var opened: [URL] = []
-let res = try? Lightroom.createAndOpen(template: emptyT, catalog: catURL, open: { opened.append($0) })
+let res = try? Lightroom.createAndOpen(template: bundled, catalog: catURL, open: { opened.append($0) })
 let contents = (try? fm.contentsOfDirectory(atPath: catURL.deletingLastPathComponent().path)) ?? []
-check(res == .created(catURL) && contents == ["import-2026-11-bears-ears.lrcat"], "creates catalog, copying ONLY the .lrcat (\(contents))")
+check(res == .created(catURL) && contents == ["import-2026-11-bears-ears.lrcat"], "creates catalog folder with just the .lrcat (\(contents))")
 check((try? Updater.sha256(of: catURL)) == beforeHash && opened == [catURL], "catalog is a byte copy of the template, then opened")
 
 try! Data("user's edits".utf8).write(to: catURL)    // pretend the user has been working in it
-let res2 = try? Lightroom.createAndOpen(template: emptyT, catalog: catURL, open: { opened.append($0) })
+let res2 = try? Lightroom.createAndOpen(template: bundled, catalog: catURL, open: { opened.append($0) })
 check(res2 == .existing(catURL) && (try? String(contentsOf: catURL, encoding: .utf8)) == "user's edits" && opened.count == 2,
       "existing catalog is opened, never overwritten")
-do {
-    try Lightroom.createAndOpen(template: lockedT, catalog: Lightroom.catalogURL(base: "import-2026-11-x", catalogsFolder: cats), open: { opened.append($0) })
-    check(false, "locked template refused")
-} catch { check(opened.count == 2 && !fm.fileExists(atPath: cats.appendingPathComponent("import-2026-11-x").path), "locked template refused, nothing created/opened: \(error.localizedDescription)") }
-
-// Template discovery order (catalogs folder = ~/Pictures by default in the app)
-let disc = lr.appendingPathComponent("disc")
-try! fm.createDirectory(at: disc, withIntermediateDirectories: true)
-func place(_ rel: String, rows: Int) -> URL {
-    let u = disc.appendingPathComponent(rel)
-    try! fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try? fm.removeItem(at: u)
-    try! fm.copyItem(at: sqliteDB("src-\(UUID().uuidString.prefix(6)).lrcat", rows: rows), to: u)
-    return u
-}
-var d = Lightroom.discoverTemplate(in: disc)
-check(d.template == nil && d.problem?.contains("File → New Catalog, name it 'template'") == true, "discovery: nothing found -> how-to message")
-_ = place("abc/notes-template.lrcat", rows: 2)            // matches name but has photos
-let mine = place("Old Stuff/My TEMPLATE.lrcat", rows: 0)  // case-insensitive match, empty
-_ = place("Trip/trip.lrcat", rows: 0)                      // no "template" in name: ignored
-d = Lightroom.discoverTemplate(in: disc)
-check(d.template == mine, "discovery: skips non-empty match, takes first valid *template*.lrcat (\(d.template?.lastPathComponent ?? "nil"))")
-let canonical = place("template/template.lrcat", rows: 0)
-check(Lightroom.discoverTemplate(in: disc).template == canonical, "discovery: template/template.lrcat wins")
-try! Data().write(to: URL(fileURLWithPath: canonical.path + ".lock"))
-check(Lightroom.discoverTemplate(in: disc).template == mine, "discovery: locked canonical template -> falls back to next valid")
-try! fm.removeItem(at: mine)
-d = Lightroom.discoverTemplate(in: disc)
-check(d.template == nil && d.problem?.contains("Lightroom has the template catalog open") == true, "discovery: only a locked one -> says Lightroom has it open")
-try! fm.removeItem(atPath: canonical.path + ".lock")
-let override = place("elsewhere/custom.lrcat", rows: 0)
-check(Lightroom.discoverTemplate(in: disc, override: override).template == override, "discovery: Settings override used first")
 
 // MARK: - Updater (offline)
 print("\n--- updater")
@@ -260,6 +219,12 @@ func makeApp(_ dir: URL, id: String, version: String) -> URL {
     let p = Process(); p.executableURL = URL(fileURLWithPath: tool); p.arguments = a
     p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
     try! p.run(); p.waitUntilExit(); return p.terminationStatus
+}
+func capture(_ tool: String, _ a: String...) -> String {
+    let p = Process(), out = Pipe(); p.executableURL = URL(fileURLWithPath: tool); p.arguments = a
+    p.standardOutput = out; p.standardError = FileHandle.nullDevice
+    try! p.run(); let d = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+    return String(decoding: d, as: UTF8.self)
 }
 func zipApp(_ app: URL, _ name: String) -> URL {
     let z = upd.appendingPathComponent(name)

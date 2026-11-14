@@ -40,14 +40,10 @@ struct OffloadApp: App {
     @Published var report: Report?
     @Published var ssd: OffloadRun.SSDStatus?
     // Lightroom (see LightroomUI.swift)
-    @Published var lrTemplate: URL? = UserDefaults.standard.string(forKey: "lrTemplatePath").map { URL(fileURLWithPath: $0) } {
-        didSet { UserDefaults.standard.set(lrTemplate?.path, forKey: "lrTemplatePath"); revalidateTemplate() }
-    }
     @Published var catalogsFolder: URL = UserDefaults.standard.string(forKey: "lrCatalogsFolder").map { URL(fileURLWithPath: $0, isDirectory: true) }
         ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true) {
-        didSet { UserDefaults.standard.set(catalogsFolder.path, forKey: "lrCatalogsFolder"); revalidateTemplate() }
+        didSet { UserDefaults.standard.set(catalogsFolder.path, forKey: "lrCatalogsFolder") }
     }
-    @Published var templateDiscovery: Lightroom.Discovery?
     @Published var catalogMessage: String?
     @Published private(set) var run: OffloadRun?
     @Published var updating = false          // an update is downloading/installing: no new runs
@@ -70,7 +66,6 @@ struct OffloadApp: App {
             nc.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }
         }
         refresh()
-        revalidateTemplate()
         AppDelegate.model = self
         startUpdateChecks()
     }

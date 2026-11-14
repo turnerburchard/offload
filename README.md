@@ -39,9 +39,8 @@ Offload never deletes or formats anything. Wiping the card is up to you.
 
 Once the SSD copy is verified, the green **Ready for Lightroom** section has a **Create catalog & open in Lightroom** button.
 
-- **One-time setup:** in Lightroom Classic, choose **File > New Catalog**, name it `template` and save it in your Pictures folder (so it ends up at `~/Pictures/template/template.lrcat`). Then quit Lightroom. Offload finds it automatically.
-- **How the template is found:** Offload checks `<Catalogs folder>/template/template.lrcat` first, then any `.lrcat` in the Catalogs folder or one level below it whose name contains "template". It uses the first one that is valid: an SQLite catalog with no photos that isn't open in Lightroom (no `.lock` file next to it). The check is read-only and runs on a temporary copy. The Catalogs folder (default `~/Pictures`) and an explicit template can be set in Settings, but you don't have to set either.
-- **What the button does:** it copies **only** the template `.lrcat` file to `<Catalogs folder>/<import name>/<import name>.lrcat`, using the same name as the SSD folder (e.g. `import-2026-11-bears-ears`). It then opens the new catalog in Lightroom Classic. If that catalog already exists, it is opened and never overwritten.
+- **No setup needed:** Offload ships with an empty Lightroom Classic catalog (`Resources/EmptyCatalog.lrcat`, made with Lightroom Classic 15 and scrubbed of personal settings). If you run a newer Lightroom, it upgrades each new catalog the first time it opens.
+- **What the button does:** it copies that empty catalog to `<Catalogs folder>/<import name>/<import name>.lrcat`, using the same name as the SSD folder (e.g. `import-2026-11-bears-ears`). It then opens the new catalog in Lightroom Classic. If that catalog already exists, it is opened and never overwritten. The Catalogs folder defaults to `~/Pictures` and can be changed in Settings.
 - **Then, in Lightroom:** Import → select the SSD folder → turn on **Include Subfolders** → choose **Add** (not Copy or Move).
 
 Offload never writes to a catalog database. There is no Lightroom plugin.
