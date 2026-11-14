@@ -52,6 +52,43 @@ public enum Lightroom {
         } catch { return .unreadable(error.localizedDescription) }
     }
 
+    public struct Discovery: Sendable {
+        public let template: URL?                              // first candidate that validates
+        public let candidates: [(url: URL, status: TemplateStatus)]   // everything looked at, in order
+        /// Why nothing usable was found (e.g. Lightroom has the template open), for the UI.
+        public var problem: String? {
+            guard template == nil else { return nil }
+            guard let (u, st) = candidates.first(where: { $0.status != .notFound }) else {
+                return "No template catalog found. In Lightroom, File → New Catalog, name it 'template' in your Pictures folder, then quit Lightroom and click again."
+            }
+            if st == .locked { return "Lightroom has the template catalog open (\(u.lastPathComponent)). Quit Lightroom, then click again." }
+            return "\(u.path): \(st.message)"
+        }
+    }
+
+    /// Finds the template: optional override first, then <catalogs>/template/template.lrcat, then any
+    /// <catalogs>/<dir>/*.lrcat or <catalogs>/*.lrcat whose name contains "template". First valid one wins.
+    public static func discoverTemplate(in catalogs: URL, override: URL? = nil) -> Discovery {
+        let fm = FileManager.default
+        var urls: [URL] = override.map { [$0] } ?? []
+        urls.append(catalogs.appendingPathComponent("template/template.lrcat"))
+        let isTemplate: (URL) -> Bool = { $0.pathExtension.lowercased() == "lrcat" && $0.lastPathComponent.lowercased().contains("template") }
+        let top = ((try? fm.contentsOfDirectory(at: catalogs, includingPropertiesForKeys: [.isDirectoryKey])) ?? [])
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        urls += top.filter(isTemplate)
+        for dir in top where (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true && dir.pathExtension.isEmpty {
+            urls += ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []).filter(isTemplate)
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        }
+        var seen = Set<String>(), checked: [(URL, TemplateStatus)] = []
+        for u in urls where seen.insert(u.standardizedFileURL.path).inserted {
+            let st = validateTemplate(u)
+            checked.append((u, st))
+            if st.isUsable { return Discovery(template: u, candidates: checked) }
+        }
+        return Discovery(template: nil, candidates: checked)
+    }
+
     /// <catalogs>/<base>/<base>.lrcat — `base` comes from `Naming.baseName`, same as the import folder.
     public static func catalogURL(base: String, catalogsFolder: URL) -> URL {
         catalogsFolder.appendingPathComponent(base, isDirectory: true).appendingPathComponent("\(base).lrcat")

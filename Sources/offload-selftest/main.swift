@@ -191,6 +191,34 @@ do {
     check(false, "locked template refused")
 } catch { check(opened.count == 2 && !fm.fileExists(atPath: cats.appendingPathComponent("import-2026-11-x").path), "locked template refused, nothing created/opened: \(error.localizedDescription)") }
 
+// Template discovery order (catalogs folder = ~/Pictures by default in the app)
+let disc = lr.appendingPathComponent("disc")
+try! fm.createDirectory(at: disc, withIntermediateDirectories: true)
+func place(_ rel: String, rows: Int) -> URL {
+    let u = disc.appendingPathComponent(rel)
+    try! fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? fm.removeItem(at: u)
+    try! fm.copyItem(at: sqliteDB("src-\(UUID().uuidString.prefix(6)).lrcat", rows: rows), to: u)
+    return u
+}
+var d = Lightroom.discoverTemplate(in: disc)
+check(d.template == nil && d.problem?.contains("File → New Catalog, name it 'template'") == true, "discovery: nothing found -> how-to message")
+_ = place("abc/notes-template.lrcat", rows: 2)            // matches name but has photos
+let mine = place("Old Stuff/My TEMPLATE.lrcat", rows: 0)  // case-insensitive match, empty
+_ = place("Trip/trip.lrcat", rows: 0)                      // no "template" in name: ignored
+d = Lightroom.discoverTemplate(in: disc)
+check(d.template == mine, "discovery: skips non-empty match, takes first valid *template*.lrcat (\(d.template?.lastPathComponent ?? "nil"))")
+let canonical = place("template/template.lrcat", rows: 0)
+check(Lightroom.discoverTemplate(in: disc).template == canonical, "discovery: template/template.lrcat wins")
+try! Data().write(to: URL(fileURLWithPath: canonical.path + ".lock"))
+check(Lightroom.discoverTemplate(in: disc).template == mine, "discovery: locked canonical template -> falls back to next valid")
+try! fm.removeItem(at: mine)
+d = Lightroom.discoverTemplate(in: disc)
+check(d.template == nil && d.problem?.contains("Lightroom has the template catalog open") == true, "discovery: only a locked one -> says Lightroom has it open")
+try! fm.removeItem(atPath: canonical.path + ".lock")
+let override = place("elsewhere/custom.lrcat", rows: 0)
+check(Lightroom.discoverTemplate(in: disc, override: override).template == override, "discovery: Settings override used first")
+
 // MARK: - Updater (offline)
 print("\n--- updater")
 func v(_ s: String) -> SemVer { SemVer(s)! }

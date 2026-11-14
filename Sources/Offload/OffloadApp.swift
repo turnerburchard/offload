@@ -44,9 +44,9 @@ struct OffloadApp: App {
     }
     @Published var catalogsFolder: URL = UserDefaults.standard.string(forKey: "lrCatalogsFolder").map { URL(fileURLWithPath: $0, isDirectory: true) }
         ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true) {
-        didSet { UserDefaults.standard.set(catalogsFolder.path, forKey: "lrCatalogsFolder") }
+        didSet { UserDefaults.standard.set(catalogsFolder.path, forKey: "lrCatalogsFolder"); revalidateTemplate() }
     }
-    @Published var templateStatus: Lightroom.TemplateStatus?
+    @Published var templateDiscovery: Lightroom.Discovery?
     @Published var catalogMessage: String?
     @Published private(set) var run: OffloadRun?
     @Published var updating = false          // an update is downloading/installing: no new runs
