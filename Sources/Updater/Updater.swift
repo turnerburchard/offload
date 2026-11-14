@@ -59,7 +59,7 @@ public struct Release: Decodable, Sendable {
 
 public enum UpdateError: LocalizedError {
     case badResponse(String), noZip, noChecksum, checksumMismatch(expected: String, actual: String)
-    case unzipFailed(String), noApp, wrongBundleID(String?), signatureInvalid(String), notWritable(String), translocated, swapFailed(String)
+    case unzipFailed(String), noApp, wrongBundleID(String?), signatureInvalid(String), signerMismatch(String), notWritable(String), translocated, swapFailed(String)
     public var errorDescription: String? {
         switch self {
         case .badResponse(let s): "GitHub request failed: \(s)"
@@ -70,6 +70,7 @@ public enum UpdateError: LocalizedError {
         case .noApp: "The update zip doesn't contain an .app."
         case .wrongBundleID(let id): "The update is a different app (bundle id \(id ?? "missing"))."
         case .signatureInvalid(let s): "The update's code signature is invalid: \(s)"
+        case .signerMismatch(let s): "The update isn't signed by the same certificate as this app, so it won't be installed. \(s)"
         case .notWritable(let p): "Can't replace the app at \(p) (no write permission). Download the update manually."
         case .translocated: "macOS is running this copy from a temporary location. Move the app to /Applications, open it from there, then update."
         case .swapFailed(let s): "Couldn't swap in the new version (the current version was left in place): \(s)"
@@ -136,9 +137,32 @@ public enum Updater {
 
     // MARK: Prepare + install
 
-    /// Verifies the zip's SHA-256, unzips it into `workDir`, and checks bundle id + code signature.
+    /// How an app is signed: ad-hoc (no certificate) or with a certificate, plus its designated requirement.
+    public struct Signing: Sendable { public let adhoc: Bool; public let requirement: String? }
+
+    public static func signing(of app: URL) -> Signing {
+        let (_, info) = run("/usr/bin/codesign", ["-dv", app.path])                 // details go to stderr
+        let (_, out) = run("/usr/bin/codesign", ["-d", "-r-", app.path], captureStdout: true)
+        let req = out.split(whereSeparator: \.isNewline).first { $0.contains("designated =>") }
+            .map { String($0[$0.range(of: "designated =>")!.upperBound...]).trimmingCharacters(in: .whitespaces) }
+        return Signing(adhoc: info.contains("Signature=adhoc") || info.contains("flags=0x2(adhoc)"), requirement: req)
+    }
+
+    /// The update must satisfy the running app's designated requirement (same identifier + same certificate leaf).
+    /// If the running app is ad-hoc signed there's nothing to pin to, so any valid signature is accepted —
+    /// that's the one-time migration to a certificate-signed build.
+    public static func checkSigner(_ newApp: URL, matches running: URL) throws {
+        let cur = signing(of: running)
+        guard !cur.adhoc else { return }
+        guard let req = cur.requirement else { throw UpdateError.signerMismatch("Couldn't read this app's signing requirement.") }
+        let (status, err) = run("/usr/bin/codesign", ["--verify", "-R", "=" + req, newApp.path])
+        guard status == 0 else { throw UpdateError.signerMismatch(err.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+
+    /// Verifies the zip's SHA-256, unzips it into `workDir`, and checks bundle id, code signature and
+    /// (if `matchSignerOf` is given) that it's signed by the same certificate as the running app.
     /// Returns the ready-to-install .app (quarantine stripped). Throws without touching the installed app.
-    public static func prepare(zip: URL, expectedSHA256: String, bundleID: String, workDir: URL) throws -> URL {
+    public static func prepare(zip: URL, expectedSHA256: String, bundleID: String, workDir: URL, matchSignerOf running: URL? = nil) throws -> URL {
         let actual = try sha256(of: zip)
         guard actual == expectedSHA256.lowercased() else { throw UpdateError.checksumMismatch(expected: expectedSHA256, actual: actual) }
         let out = workDir.appendingPathComponent("unzipped-\(UUID().uuidString)")
@@ -152,6 +176,7 @@ public enum Updater {
         _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
         let (sigStatus, sigErr) = run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
         guard sigStatus == 0 else { throw UpdateError.signatureInvalid(sigErr.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if let running { try checkSigner(app, matches: running) }
         return app
     }
 
@@ -172,24 +197,45 @@ public enum Updater {
         try? fm.removeItem(at: backup)
     }
 
+    /// Install-on-quit: swap in a staged update unless a copy/verify run is in progress.
+    /// Returns true if the new version is now in place. Failures leave the old app intact.
+    @discardableResult
+    public static func installOnQuit(staged: URL?, appURL: URL, runInProgress: Bool) -> Bool {
+        guard !runInProgress, let staged, FileManager.default.fileExists(atPath: staged.path) else { return false }
+        return (try? install(staged, replacing: appURL)) != nil
+    }
+
     /// Temp dir on the same volume as `url`, so the final move is a rename.
     public static func workDir(near url: URL) throws -> URL {
         try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: url, create: true)
     }
 
-    /// Download → verify → install. Leaves the installed app untouched on any failure.
-    public static func downloadAndInstall(_ r: Release, bundleID: String, appURL: URL) async throws {
+    /// Download + verify into a staging dir next to the app, without touching the installed app.
+    /// Returns the staged .app; install it later with `install(_:replacing:)` (e.g. when the app quits).
+    public static func stage(_ r: Release, bundleID: String, appURL: URL) async throws -> URL {
         guard let zip = r.zipAsset else { throw UpdateError.noZip }
         let fetch: (URL) async throws -> Data = { try await URLSession.shared.data(from: $0).0 }
         let sha = try await expectedSHA256(r, fetch: fetch)
         let work = try workDir(near: appURL)
-        defer { try? FileManager.default.removeItem(at: work) }
-        let (tmp, resp) = try await URLSession.shared.download(from: zip.browser_download_url)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.badResponse("download failed") }
-        let local = work.appendingPathComponent(zip.name)
-        try FileManager.default.moveItem(at: tmp, to: local)
-        let app = try prepare(zip: local, expectedSHA256: sha, bundleID: bundleID, workDir: work)
-        try install(app, replacing: appURL)
+        do {
+            let (tmp, resp) = try await URLSession.shared.download(from: zip.browser_download_url)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.badResponse("download failed") }
+            let local = work.appendingPathComponent(zip.name)
+            try FileManager.default.moveItem(at: tmp, to: local)
+            let app = try prepare(zip: local, expectedSHA256: sha, bundleID: bundleID, workDir: work, matchSignerOf: appURL)
+            try? FileManager.default.removeItem(at: local)
+            return app
+        } catch {
+            try? FileManager.default.removeItem(at: work)
+            throw error
+        }
+    }
+
+    /// Download → verify → install now. Leaves the installed app untouched on any failure.
+    public static func downloadAndInstall(_ r: Release, bundleID: String, appURL: URL) async throws {
+        let staged = try await stage(r, bundleID: bundleID, appURL: appURL)
+        defer { try? FileManager.default.removeItem(at: staged.deletingLastPathComponent().deletingLastPathComponent()) }
+        try install(staged, replacing: appURL)
     }
 
     /// Waits for this process to exit, then reopens the app.
@@ -202,10 +248,10 @@ public enum Updater {
     }
 
     @discardableResult
-    static func run(_ tool: String, _ args: [String]) -> (Int32, String) {
+    static func run(_ tool: String, _ args: [String], captureStdout: Bool = false) -> (Int32, String) {
         let p = Process(), err = Pipe()
         p.executableURL = URL(fileURLWithPath: tool); p.arguments = args
-        p.standardError = err; p.standardOutput = FileHandle.nullDevice
+        p.standardError = err; p.standardOutput = captureStdout ? err : FileHandle.nullDevice
         do { try p.run() } catch { return (-1, error.localizedDescription) }
         let data = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()

@@ -42,5 +42,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSRemovableVolumesUsageDescription</key><string>Reads SD cards and copies photos to your backup drives.</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$APP"   # ad-hoc signature so Gatekeeper/TCC treat it as one stable app
+# Signing: $OFFLOAD_SIGN_IDENTITY = SHA-1 hash of a code-signing identity (a self-signed cert is fine, but
+# codesign can't find an untrusted cert by name, so pass the hash). A stable certificate keeps macOS from
+# re-asking for removable-volume access after updates, and lets the updater pin updates to that certificate.
+# Unset -> ad-hoc signature (local builds).
+SIGN_ID=${OFFLOAD_SIGN_IDENTITY:--}
+codesign --force --sign "$SIGN_ID" "$APP"
+[[ "$SIGN_ID" == "-" ]] && echo "Signed ad-hoc" || codesign -d -r- "$APP" 2>&1 | grep designated
 echo "Built $PWD/$APP (version $VERSION, build $BUILD_NUMBER, updates from $REPO)"

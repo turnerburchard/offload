@@ -7,6 +7,14 @@ on:
 permissions:
   contents: write   # create the release
 
+# Required repository secrets:
+#   OFFLOAD_SIGNING_P12           base64 of the code-signing .p12 (self-signed cert; export with `openssl pkcs12 -export -legacy`)
+#   OFFLOAD_SIGNING_P12_PASSWORD  its password
+# Every release must be signed with the SAME certificate: installed copies refuse updates whose
+# certificate leaf differs from their own (see EXPECTED_LEAF).
+env:
+  EXPECTED_LEAF: 84cf117dee32c5c07c1d6ca4a0a32bb22fde4d1e
+
 jobs:
   release:
     # macos-15 ships Xcode 16.x (Swift 6.x), which supports swift-tools-version 6.0.
@@ -19,8 +27,44 @@ jobs:
       - name: Toolchain
         run: swift --version
 
+      - name: Import signing certificate
+        env:
+          P12: ${{ secrets.OFFLOAD_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.OFFLOAD_SIGNING_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12" ] || [ -z "$P12_PASSWORD" ]; then
+            echo "::error::Missing secrets OFFLOAD_SIGNING_P12 and/or OFFLOAD_SIGNING_P12_PASSWORD. Releases must be certificate-signed."
+            exit 1
+          fi
+          K="$RUNNER_TEMP/offload-signing.keychain-db"
+          KPW="$(uuidgen)"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$KPW" "$K"
+          security set-keychain-settings -lut 21600 "$K"
+          security unlock-keychain -p "$KPW" "$K"
+          security import "$RUNNER_TEMP/signing.p12" -k "$K" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$K" > /dev/null
+          # Self-signed = untrusted, so codesign only finds it if the keychain is in the user search list.
+          security list-keychains -d user -s "$K" $(security list-keychains -d user | tr -d '"')
+          # No -v: the cert is untrusted, so it isn't "valid" — take the SHA-1 hash of the identity.
+          ID=$(security find-identity -p codesigning "$K" | awk '/[0-9A-F]{40}/ {print $2; exit}')
+          if [ -z "$ID" ]; then echo "::error::No code-signing identity found in OFFLOAD_SIGNING_P12"; exit 1; fi
+          echo "OFFLOAD_SIGN_IDENTITY=$ID" >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$K" >> "$GITHUB_ENV"
+
       - name: Build (fails if the tag doesn't match VERSION)
         run: ./build.sh release
+
+      - name: Check signing certificate
+        run: |
+          codesign --verify --deep --strict Offload.app
+          DR=$(codesign -d -r- Offload.app 2>&1 | grep designated)
+          echo "$DR"
+          if ! echo "$DR" | grep -qi "certificate leaf = H\"$EXPECTED_LEAF\""; then
+            echo "::error::Signed with an unexpected certificate. Installed copies would reject this update."
+            exit 1
+          fi
 
       - name: Self-test
         run: .build/release/offload-selftest "$RUNNER_TEMP/selftest"
@@ -44,7 +88,7 @@ jobs:
           {
             echo "Offload ${{ steps.pkg.outputs.version }}"
             echo
-            echo "Unsigned (ad-hoc) build. First launch: right-click Offload.app → Open."
+            echo "Signed with a self-signed certificate (not notarized). First launch: right-click Offload.app → Open."
             echo
             echo "SHA-256:"
             echo '```'
@@ -53,3 +97,8 @@ jobs:
           } > notes.md
           gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
             --title "Offload ${{ steps.pkg.outputs.version }}" --notes-file notes.md
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" || true

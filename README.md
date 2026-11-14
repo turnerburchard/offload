@@ -55,18 +55,23 @@ Offload never writes to a catalog database. There is no Lightroom plugin.
 
 ### Updates
 
-Offload checks GitHub Releases at launch, and you can check any time with **Check for Updates…** in the app menu. It always asks before installing, and it never updates during a copy or verification. Before installing, it checks that:
+By default Offload updates itself. It checks GitHub Releases at launch and every 24 hours. When there's a new version, it downloads and verifies it quietly in the background, and installs it **when you quit**, so the next launch is the new version. A small "Update ready — Restart now" bar lets you install right away. Updates are never installed while a copy or verification is running.
 
-- the downloaded zip's SHA-256 matches the checksum published with the release,
+You can turn off *Automatically download and install updates* in Settings. Offload will then ask you before downloading anything. **Check for Updates…** in the app menu works in either mode.
+
+Before installing, Offload checks that:
+
+- the zip's SHA-256 matches the checksum published with the release,
 - the app inside has the same bundle id,
-- `codesign --verify` passes.
+- `codesign --verify` passes,
+- the update is **signed by the same certificate as the installed app** (its designated requirement: identifier plus certificate leaf).
 
-It then swaps the new app into place and relaunches. If anything fails, the current version is left untouched.
+If any check fails, the installed app is left untouched.
 
-Limitations of an ad-hoc-signed updater:
+Notes:
 
-- The checksum and the zip come from the same GitHub release. That protects against corrupted or truncated downloads, not against someone who controls the GitHub repository.
-- Each build has a different ad-hoc signature, so macOS may ask for removable-volume access again after an update.
+- Releases are signed with a self-signed certificate (not a Developer ID, not notarized). The stable certificate means macOS keeps the app's removable-volume permission across updates.
+- An ad-hoc-signed install (a local build or v0.2.x) accepts the first certificate-signed update. That one-time step is how existing installs switch over to the certificate.
 
 Forks: the update source comes from the `OffloadUpdateRepo` Info.plist key. `build.sh` sets it from `$OFFLOAD_REPO`, or `$GITHUB_REPOSITORY` in Actions.
 
@@ -85,6 +90,17 @@ You only need the Xcode Command Line Tools (Swift 6.0 or newer). Full Xcode isn'
 
 The version comes from the `VERSION` file.
 
+## Signing
+
+`build.sh` signs with the identity whose SHA-1 hash is in `$OFFLOAD_SIGN_IDENTITY`, or ad-hoc if it's unset. A self-signed certificate is untrusted, so codesign can't look it up by name. Pass the hash, and make sure its keychain is in the user search list.
+
+The release workflow needs two repository secrets:
+
+- `OFFLOAD_SIGNING_P12`: base64 of the `.p12`, exported with `openssl pkcs12 -export -legacy`.
+- `OFFLOAD_SIGNING_P12_PASSWORD`: its password.
+
+The workflow fails if either secret is missing, or if the build's certificate leaf doesn't match `EXPECTED_LEAF` in the workflow. Installed copies only accept updates signed with that certificate, so keep the certificate and never rotate it casually.
+
 ## Self-test
 
 The self-test exercises the copy and verify engine against fake drives in a temp folder, and the updater offline. Neither touches real volumes.
@@ -92,6 +108,7 @@ The self-test exercises the copy and verify engine against fake drives in a temp
 ```sh
 .build/release/offload-selftest                 # uses a fresh temp dir
 .build/release/offload-selftest /tmp/x a.ARW    # optional: also checks EXIF reading on a real raw file
+scripts/test-signing.sh                         # also runs the certificate-pinning tests (throwaway certs in a temp keychain)
 ```
 
 ## Releasing

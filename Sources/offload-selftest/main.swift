@@ -308,5 +308,44 @@ expectThrow("failed install leaves old app intact") {
 }
 expectThrow("refuses translocated app") { try Updater.install(installed, replacing: URL(fileURLWithPath: "/private/var/folders/x/AppTranslocation/ABC/d/Offload.app")) }
 
+// Install-on-quit staging
+print("\n--- install on quit")
+let stagingDir = upd.appendingPathComponent("staging")
+try! fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+func installedVersion() -> String? { NSDictionary(contentsOf: installed.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String }
+let z4 = zipApp(makeApp(upd.appendingPathComponent("build-0.4"), id: bundleID, version: "0.4.0"), "v4.zip")
+let staged = try! Updater.prepare(zip: z4, expectedSHA256: try! Updater.sha256(of: z4), bundleID: bundleID, workDir: stagingDir, matchSignerOf: installed)
+check(installedVersion() == "0.3.0", "staging (download+verify) doesn't touch the installed app; ad-hoc running app accepts any valid signer (migration)")
+check(!Updater.installOnQuit(staged: staged, appURL: installed, runInProgress: true) && installedVersion() == "0.3.0" && fm.fileExists(atPath: staged.path),
+      "quit during a run: NOT installed, staged copy kept")
+check(Updater.installOnQuit(staged: staged, appURL: installed, runInProgress: false) && installedVersion() == "0.4.0" && !fm.fileExists(atPath: staged.path),
+      "quit with no run: staged update swapped in")
+check(!Updater.installOnQuit(staged: nil, appURL: installed, runInProgress: false) && installedVersion() == "0.4.0", "nothing staged: nothing happens")
+check(!Updater.installOnQuit(staged: upd.appendingPathComponent("gone.app"), appURL: installed, runInProgress: false) && installedVersion() == "0.4.0",
+      "staged copy vanished (temp cleaned): old app intact")
+
+// Certificate pinning. Needs two code-signing identities: run scripts/test-signing.sh, which makes throwaway
+// self-signed certs in a temporary keychain and sets OFFLOAD_TEST_SIGN_IDS="<sha1 A>,<sha1 B>".
+if let ids = ProcessInfo.processInfo.environment["OFFLOAD_TEST_SIGN_IDS"]?.split(separator: ","), ids.count == 2 {
+    print("\n--- certificate pinning")
+    func signedApp(_ name: String, _ identity: String, version: String) -> URL {
+        let app = makeApp(upd.appendingPathComponent("cert-\(name)"), id: bundleID, version: version)
+        check(shell("/usr/bin/codesign", "--force", "--sign", identity, app.path) == 0, "signed \(name) with \(identity == "-" ? "ad-hoc" : "cert " + identity.prefix(8))")
+        return app
+    }
+    let runningA = signedApp("running-A", String(ids[0]), version: "0.3.0")
+    let sig = Updater.signing(of: runningA)
+    check(!sig.adhoc && sig.requirement?.contains("certificate leaf") == true && sig.requirement?.contains(bundleID) == true,
+          "running app's designated requirement pins identifier + certificate leaf: \(sig.requirement ?? "nil")")
+    do { try Updater.checkSigner(signedApp("update-A", String(ids[0]), version: "0.4.0"), matches: runningA); check(true, "same certificate -> accepted") }
+    catch { check(false, "same certificate -> accepted (\(error.localizedDescription))") }
+    expectThrow("different certificate -> rejected") { try Updater.checkSigner(signedApp("update-B", String(ids[1]), version: "0.4.0"), matches: runningA) }
+    expectThrow("ad-hoc update for a cert-signed app -> rejected") { try Updater.checkSigner(signedApp("update-adhoc", "-", version: "0.4.0"), matches: runningA) }
+    expectThrow("end-to-end prepare() rejects other-cert zip") {
+        let z = zipApp(signedApp("zip-B", String(ids[1]), version: "0.4.0"), "certB.zip")
+        _ = try Updater.prepare(zip: z, expectedSHA256: try Updater.sha256(of: z), bundleID: bundleID, workDir: work, matchSignerOf: runningA)
+    }
+} else { print("(skipping certificate-pinning tests: run scripts/test-signing.sh)") }
+
 print(failures == 0 ? "\nALL PASSED" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

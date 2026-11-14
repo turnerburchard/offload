@@ -6,6 +6,7 @@ import Updater
 @main
 struct OffloadApp: App {
     @StateObject private var model = AppModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     init() { NSApplication.shared.setActivationPolicy(.regular) }   // so `swift run` also gets a Dock icon / focus
     var body: some Scene {
         WindowGroup("SD Offload") { ContentView().environmentObject(model).frame(minWidth: 640, minHeight: 680) }
@@ -50,7 +51,12 @@ struct OffloadApp: App {
     @Published var catalogMessage: String?
     @Published private(set) var run: OffloadRun?
     @Published var updating = false          // an update is downloading/installing: no new runs
-    var pendingUpdate: Release?              // found during a run; offered once it ends
+    var pendingUpdate: Release?              // found during a run; offered once it ends (manual mode)
+    @Published var stagedUpdate: StagedUpdate?   // downloaded + verified; swapped in on quit
+    @Published var stagingUpdate = false
+    @Published var autoUpdate: Bool = UserDefaults.standard.object(forKey: "autoUpdate") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoUpdate, forKey: "autoUpdate") }
+    }
 
     init() {
         if let o = ProcessInfo.processInfo.environment["OFFLOAD_VOLUMES_ROOT"] {
@@ -65,7 +71,8 @@ struct OffloadApp: App {
         }
         refresh()
         revalidateTemplate()
-        Task { try? await Task.sleep(for: .seconds(2)); checkForUpdates(userInitiated: false) }
+        AppDelegate.model = self
+        startUpdateChecks()
     }
 
     private func saveRoles() { UserDefaults.standard.set(try? JSONEncoder().encode(roles), forKey: defaultsKey) }
@@ -164,6 +171,7 @@ struct ContentView: View {
             Section { actions }
             if let s = m.ssd { Section("Editing SSD") { SSDView(status: s) } }
             if let r = m.report { Section("Result") { ReportView(report: r) } }
+            if m.stagedUpdate != nil { Section { UpdateFooter() } }
         }
         .formStyle(.grouped)
     }
@@ -333,6 +341,11 @@ struct DrivesView: View {
                     .foregroundStyle(.secondary)
             }
             LightroomSettingsSection()
+            Section("Updates") {
+                Toggle("Automatically download and install updates", isOn: $m.autoUpdate)
+                Text(m.autoUpdate ? "Updates download in the background and install when you quit Offload (never during a copy)."
+                                  : "You'll be asked before anything is downloaded.").font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
