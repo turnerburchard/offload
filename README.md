@@ -45,6 +45,17 @@ Once the SSD copy is verified, the green **Ready for Lightroom** section has a *
 
 Offload never writes to a catalog database. There is no Lightroom plugin.
 
+## Ask Claude (for your own copy)
+
+If this Mac has [Claude Code](https://claude.com/claude-code) and a copy of Offload's source, a **✨ Ask** button appears in the toolbar. You can also press **⌘K**. Ask how to do something in plain words and you get a short answer. If Offload can't do it yet, Claude offers to add it.
+
+- **Answering questions:** Claude can only read the source. It can't change anything.
+- **When you say yes:** Claude makes the change, adds a check for it to the self-test, and builds. Offload then checks the work itself: it builds again, runs the full self-test, and accepts the change only if every check passes. It then bumps the version, saves a git commit `Ask Claude: <what you asked for>` with a `v<version>` tag, and restarts into the new version. After that it pushes to GitHub using your `gh` login, and the release workflow publishes the update. If the push fails, the change is still saved on this Mac and a **Retry** button appears.
+- **Safety:** Claude must ask you first before changing anything about copying, checking files, or deciding when a card is safe to wipe. Nothing is built or restarted while a copy is running. The restart waits until the copy finishes.
+- **If something goes wrong:** the change is put aside with `git stash` (named `ask-claude-failed-…`), never deleted. The app you're using keeps running.
+- **Undo:** after a change, the chat shows **Undo "…"**. Undo reverts that change as a new version.
+- **Where the source lives:** `./build.sh` records the folder it was built from. You can change the folder in **Settings → Ask Claude → Source folder**. It defaults to `~/code/offload`. Builds from GitHub Actions don't record a folder. The button stays hidden until Claude Code and a valid source folder (one with `Package.swift` and `.git`) are both found.
+
 ## Install
 
 1. Download `Offload-x.y.z.zip` from [Releases](../../releases) and unzip it.
@@ -91,7 +102,7 @@ The version comes from the `VERSION` file.
 
 ## Signing
 
-`build.sh` signs with the identity whose SHA-1 hash is in `$OFFLOAD_SIGN_IDENTITY`, or ad-hoc if it's unset. A self-signed certificate is untrusted, so codesign can't look it up by name. Pass the hash, and make sure its keychain is in the user search list.
+`build.sh` signs with the identity whose SHA-1 hash is in `$OFFLOAD_SIGN_IDENTITY`, or ad-hoc if it's unset. A self-signed certificate is untrusted, so codesign can't look it up by name. Pass the hash, and make sure its keychain is in the user search list. If `$OFFLOAD_SIGN_IDENTITY` is unset and `~/.config/offload-signing/offload-signing.p12` and `p12-password.txt` both exist, `build.sh` signs with that certificate instead. It imports the certificate into a temporary keychain and restores your keychain search list afterwards. Signing with the release certificate lets locally built copies (including Ask Claude builds) keep accepting official updates.
 
 The release workflow needs two repository secrets:
 
@@ -102,7 +113,7 @@ The workflow fails if either secret is missing, or if the build's certificate le
 
 ## Self-test
 
-The self-test exercises the copy and verify engine against fake drives in a temp folder, and the updater offline. Neither touches real volumes.
+The self-test exercises the copy and verify engine against fake drives in a temp folder, and the updater offline. Neither touches real volumes. It also runs the whole Ask Claude flow in a throwaway clone with a fake `claude`, pushing only to a local bare repo.
 
 ```sh
 .build/release/offload-selftest                 # uses a fresh temp dir

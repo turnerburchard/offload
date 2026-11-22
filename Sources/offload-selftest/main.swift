@@ -3,6 +3,7 @@
 import Foundation
 import OffloadCore
 import Updater
+import Assistant
 
 let args = CommandLine.arguments
 let fm = FileManager.default
@@ -314,6 +315,191 @@ if let ids = ProcessInfo.processInfo.environment["OFFLOAD_TEST_SIGN_IDS"]?.split
         _ = try Updater.prepare(zip: z, expectedSHA256: try Updater.sha256(of: z), bundleID: bundleID, workDir: work, matchSignerOf: runningA)
     }
 } else { print("(skipping certificate-pinning tests: run scripts/test-signing.sh)") }
+
+// MARK: - Ask Claude (fake `claude` in a throwaway clone; pushes go to a local bare repo, never GitHub)
+
+check(ParsedReply.parse("Great, I'll add that now.\n<<REQUEST: show a smiley>>\n<<BUILD>>") == ParsedReply(display: "Great, I'll add that now.", marker: .build, request: "show a smiley"), "parse BUILD + REQUEST")
+check(ParsedReply.parse("Offload now has a smiley. <<DONE>>").marker == .done, "parse inline DONE")
+check(ParsedReply.parse("Offload now has a smiley. <<DONE>>").display == "Offload now has a smiley.", "inline marker stripped")
+check(ParsedReply.parse("Yes, it copies video.").marker == nil, "plain answer has no marker")
+check(AskClaude.bumpPatch("0.4.0") == "0.4.1" && AskClaude.bumpPatch("nope") == nil, "bumpPatch")
+check(ClaudeCLI.friendlyStep(tool: "Bash", input: ["command": "./build.sh"]) == "Putting the new version together…", "friendly step for build")
+let askArgs = ClaudeCLI.arguments(mode: .ask, session: nil, systemPrompt: "x")
+let buildArgs = ClaudeCLI.arguments(mode: .build, session: "s1", systemPrompt: "x")
+check(askArgs.contains("dontAsk") && askArgs.contains("Read,Grep,Glob") && !askArgs.joined(separator: " ").contains("Edit") && !askArgs.contains("--resume"), "ask phase is read-only")
+check(buildArgs.contains("Read,Grep,Glob,Edit,Write,Bash(./build.sh*),Bash(.build/*/offload-selftest*),Bash(git status*),Bash(git diff*)") && buildArgs.contains("--resume") && buildArgs.contains("s1"), "build phase: limited Bash, resumes session")
+
+// LocalInstall: swap a locally built app over the "running" one.
+do {
+    let lapps = upd.appendingPathComponent("LocalApplications")
+    let running = makeApp(lapps, id: bundleID, version: "0.4.0")
+    let built = makeApp(upd.appendingPathComponent("local-build"), id: bundleID, version: "0.4.1")
+    let swapped = try LocalInstall.install(built: built, replacing: running)
+    let ver = NSDictionary(contentsOf: running.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String
+    check(swapped && ver == "0.4.1", "local build swapped in (\(ver ?? "nil"))")
+    check(fm.fileExists(atPath: built.path), "local build left in place")
+    check(((try? fm.contentsOfDirectory(atPath: lapps.path)) ?? []) == ["Offload.app"], "no leftovers next to the app")
+    check((try? LocalInstall.install(built: running, replacing: running)) == false, "same bundle: no-op")
+} catch { check(false, "LocalInstall threw \(error)") }
+
+let srcRepo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+if AskEnvironment.isSourceCheckout(srcRepo) {
+    let ask = scratch.appendingPathComponent("ask")
+    try? fm.removeItem(at: ask)
+    try! fm.createDirectory(at: ask, withIntermediateDirectories: true)
+    let clone = ask.appendingPathComponent("clone"), bare = ask.appendingPathComponent("remote.git"), fake = ask.appendingPathComponent("fake")
+    try! fm.createDirectory(at: fake, withIntermediateDirectories: true)
+    func git(_ a: String...) -> (Int32, String) { AskEnvironment.run(URL(fileURLWithPath: "/usr/bin/git"), Array(a), cwd: clone) }
+    _ = AskEnvironment.run(URL(fileURLWithPath: "/usr/bin/git"), ["clone", "-q", "--no-hardlinks", srcRepo.path, clone.path], cwd: ask)
+    _ = AskEnvironment.run(URL(fileURLWithPath: "/usr/bin/git"), ["init", "-q", "--bare", bare.path], cwd: ask)
+    for c in [["checkout", "-q", "-B", "main"], ["remote", "set-url", "origin", bare.path], ["config", "user.name", "Offload Selftest"],
+              ["config", "user.email", "selftest@example.invalid"], ["config", "commit.gpgsign", "false"], ["config", "tag.gpgsign", "false"]] {
+        _ = AskEnvironment.run(URL(fileURLWithPath: "/usr/bin/git"), c, cwd: clone)
+    }
+    check(git("remote", "get-url", "origin").1.trimmingCharacters(in: .whitespacesAndNewlines) == bare.path, "clone pushes only to the local bare repo")
+
+    // The fake Claude: logs its arguments + prompt, emits stream-json; behaviour from fake/scenario.
+    let fakeClaude = fake.appendingPathComponent("claude")
+    try! """
+    #!/bin/sh
+    D="\(fake.path)"
+    prompt=$(cat)
+    mkdir -p "$D/calls"
+    n=$(ls "$D/calls" | wc -l | tr -d ' ')
+    printf '%s\\n' "$@" > "$D/calls/$(printf %03d $n)"
+    printf '%s' "$prompt" >> "$D/calls/$(printf %03d $n)"
+    scen=$(cat "$D/scenario")
+    emit() {
+      printf '{"type":"system","subtype":"init","session_id":"fake-1","tools":["Read"]}\\n'
+      printf '{"type":"assistant","session_id":"fake-1","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}\\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"%s"}\\n' "$1"
+    }
+    case "$*" in
+      *Read,Grep,Glob,Edit*) mode=build ;;
+      *) mode=ask ;;
+    esac
+    if [ $mode = ask ]; then
+      case "$prompt" in
+        *[Yy]es*) emit "Great, I'll add that now.\\n<<REQUEST: show a smiley>>\\n<<BUILD>>" ;;
+        *) emit "Offload can't do that yet. Want me to add it?" ;;
+      esac
+      exit 0
+    fi
+    case "$scen" in
+      success) echo "smiley $n" >> README.md; emit "Offload now shows a smiley.\\n<<DONE>>" ;;
+      break) echo "broken $n" >> README.md; touch BREAK; emit "Offload now shows a smiley.\\n<<DONE>>" ;;
+      giveup) echo "half $n" >> README.md; emit "I couldn't make that work.\\n<<FAILED>>" ;;
+      nochange) emit "All done.\\n<<DONE>>" ;;
+      needsok)
+        case "$prompt" in
+          *"No, don"*) emit "Okay, I won't change it.\\n<<FAILED>>" ;;
+          *"Yes, go ahead"*) echo "safety $n" >> README.md; emit "Offload now double-checks twice.\\n<<DONE>>" ;;
+          *) emit "This changes how Offload checks your files, which could affect safety. Is that OK?\\n<<NEEDS_OK>>" ;;
+        esac ;;
+    esac
+    """.write(to: fakeClaude, atomically: true, encoding: .utf8)
+    let fakeBuild = fake.appendingPathComponent("build.sh"), fakeTest = fake.appendingPathComponent("selftest.sh")
+    try! "#!/bin/sh\necho building\nexit 0\n".write(to: fakeBuild, atomically: true, encoding: .utf8)
+    try! "#!/bin/sh\nif [ -e BREAK ]; then echo '1 FAILED'; exit 1; fi\necho 'ALL PASSED'\n".write(to: fakeTest, atomically: true, encoding: .utf8)
+    for f in [fakeClaude, fakeBuild, fakeTest] { try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: f.path) }
+    func scenario(_ s: String) { try! s.write(to: fake.appendingPathComponent("scenario"), atomically: true, encoding: .utf8) }
+    func calls() -> [String] {
+        let d = fake.appendingPathComponent("calls")
+        return ((try? fm.contentsOfDirectory(atPath: d.path)) ?? []).sorted().map { (try? String(contentsOf: d.appendingPathComponent($0), encoding: .utf8)) ?? "" }
+    }
+    func version() -> String { ((try? String(contentsOf: clone.appendingPathComponent("VERSION"), encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+    func head() -> String { git("rev-parse", "HEAD").1.trimmingCharacters(in: .whitespacesAndNewlines) }
+    func clean() -> Bool { git("status", "--porcelain").1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    func stashes() -> Int { git("stash", "list").1.components(separatedBy: "ask-claude-failed-").count - 1 }
+
+    var cfg = AskClaude.Config(repo: clone, claude: ClaudeCLI(binary: fakeClaude))
+    cfg.buildCommand = [fakeBuild.path]; cfg.testCommand = [fakeTest.path]
+    var copying = false
+    cfg.isRunInProgress = { copying }
+    let a = AskClaude(cfg)
+    var bubbles: [String] = []
+    a.onMessage = { bubbles.append($0) }
+
+    // 1. Ask only: read-only tools, nothing changes.
+    scenario("success")
+    let v0 = version(), h0 = head()
+    let r1 = a.send("Can it put a smiley on the window?")
+    check(r1 == .answer("Offload can't do that yet. Want me to add it?"), "ask: plain answer (\(r1))")
+    let c1 = calls().last ?? ""
+    check(c1.contains("Read,Grep,Glob") && c1.contains("dontAsk") && !c1.contains("Edit") && !c1.contains("Bash") && !c1.contains("--resume"), "ask: claude got read-only tools")
+    check(clean() && head() == h0 && version() == v0, "ask: repo untouched")
+
+    // 2. Build success: version bumped, commit + tag, push lands in the bare remote.
+    let r2 = a.send("Yes please")
+    let v1 = AskClaude.bumpPatch(v0) ?? "?"
+    check(r2 == .built(version: v1, summary: "show a smiley", message: "Offload now shows a smiley."), "build: built \(v1) (\(r2))")
+    check(bubbles == ["Great, I'll add that now."], "build: 'adding it' bubble shown")
+    let c2 = calls().last ?? ""
+    check(c2.contains("--resume\nfake-1") && c2.contains("Bash(./build.sh*)") && c2.contains("Edit"), "build: resumed session with edit tools")
+    check(version() == v1 && git("log", "-1", "--format=%s").1.trimmingCharacters(in: .whitespacesAndNewlines) == "Ask Claude: show a smiley", "build: VERSION bumped + commit made")
+    check(git("tag", "--list", "v\(v1)").1.contains("v\(v1)") && clean(), "build: tagged, tree clean")
+    check(a.lastChangeSummary() == "show a smiley", "undo offered for the last change")
+    check(a.push(version: v1), "push to local bare remote")
+    let bareTags = AskEnvironment.run(URL(fileURLWithPath: "/usr/bin/git"), ["--git-dir", bare.path, "tag"], cwd: nil).1
+    let bareHead = AskEnvironment.run(URL(fileURLWithPath: "/usr/bin/git"), ["--git-dir", bare.path, "rev-parse", "main"], cwd: nil).1
+    check(bareTags.contains("v\(v1)") && bareHead.trimmingCharacters(in: .whitespacesAndNewlines) == head(), "bare remote has the commit + tag v\(v1)")
+
+    // 3. Self-test fails: everything stashed, nothing committed, version unchanged.
+    scenario("break")
+    let h2 = head(), st0 = stashes()
+    let r3 = a.send("Yes, add a frown too")
+    if case .failed = r3 { check(true, "failing self-test -> failed") } else { check(false, "failing self-test -> failed (\(r3))") }
+    check(head() == h2 && version() == v1 && clean() && stashes() == st0 + 1, "failed change stashed; no commit; version unchanged")
+
+    // Claude gives up / changes nothing / dirty tree.
+    scenario("giveup")
+    let r3b = a.send("Yes, add sparkles")
+    check(r3b == .failed("I couldn't make that work.") && head() == h2 && clean(), "Claude gives up: plain reason, nothing kept")
+    scenario("nochange")
+    let r3c = a.send("Yes, do it")
+    if case .failed = r3c { check(head() == h2 && version() == v1, "'done' without changes isn't accepted") } else { check(false, "'done' without changes (\(r3c))") }
+    try! "x".write(to: clone.appendingPathComponent("stray.txt"), atomically: true, encoding: .utf8)
+    let nBefore = calls().count
+    scenario("success")
+    let r3d = a.send("Yes, again")
+    if case .failed = r3d { check(calls().count == nBefore + 1 && fm.fileExists(atPath: clone.appendingPathComponent("stray.txt").path), "dirty source folder: refuses, keeps user's file") }
+    else { check(false, "dirty source folder (\(r3d))") }
+    try! fm.removeItem(at: clone.appendingPathComponent("stray.txt"))
+
+    // 4. NEEDS_OK: stops and asks; "no" changes nothing; "yes" builds.
+    scenario("needsok")
+    let r4 = a.send("Yes, check files twice")
+    if case .needsOK(let q) = r4 { check(q.contains("Is that OK?") && a.awaitingOK && head() == h2 && clean(), "NEEDS_OK: asks first, nothing changed") } else { check(false, "NEEDS_OK (\(r4))") }
+    let r4n = a.send("No, don't do that.")
+    check(r4n == .failed("Okay, I won't change it.") && !a.awaitingOK && head() == h2, "NEEDS_OK + no: nothing changed")
+    _ = a.send("Yes, check files twice")
+    let r4y = a.send("Yes, go ahead.")
+    let v2 = AskClaude.bumpPatch(v1) ?? "?"
+    check(r4y == .built(version: v2, summary: "show a smiley", message: "Offload now double-checks twice."), "NEEDS_OK + yes: built \(v2) (\(r4y))")
+    check(version() == v2, "NEEDS_OK + yes: version \(v2)")
+
+    // 5. Undo: reverts the last change as a new version.
+    let readmeBefore = (try? String(contentsOf: clone.appendingPathComponent("README.md"), encoding: .utf8)) ?? ""
+    let r5 = a.undoLastChange()
+    let v3 = AskClaude.bumpPatch(v2) ?? "?"
+    let readmeAfter = (try? String(contentsOf: clone.appendingPathComponent("README.md"), encoding: .utf8)) ?? ""
+    check(r5 == .built(version: v3, summary: "show a smiley", message: "Undid “show a smiley”."), "undo: built \(v3) (\(r5))")
+    check(readmeBefore.contains("safety") && !readmeAfter.contains("safety") && readmeAfter.contains("smiley"), "undo: only the last change reverted")
+    check(version() == v3 && git("log", "-1", "--format=%s").1.hasPrefix("Undo Ask Claude:") && a.lastChangeSummary() == nil, "undo: version \(v3), undo commit, no second undo")
+
+    // 6. Refuses during a copy/verify run.
+    copying = true
+    let h5 = head(), n6 = calls().count
+    scenario("success")
+    let r6 = a.send("Yes, add confetti")
+    check(r6 == .refused("A copy is running. Ask me again when it's finished.") && head() == h5 && clean(), "refuses to build during a run")
+    check(calls().count == n6 + 1, "only the read-only ask ran during the run")
+    copying = false
+
+    // Push failure is reported (UI shows "couldn't share to GitHub yet" + Retry).
+    a.config.remote = ask.appendingPathComponent("missing.git").path
+    check(!a.push(version: v3), "push failure reported")
+} else { print("(skipping Ask Claude flow: source checkout not found at \(srcRepo.path))") }
 
 print(failures == 0 ? "\nALL PASSED" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

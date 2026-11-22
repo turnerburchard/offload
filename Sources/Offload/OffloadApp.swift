@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import OffloadCore
 import Updater
+import Assistant
 
 @main
 struct OffloadApp: App {
@@ -13,6 +14,11 @@ struct OffloadApp: App {
         Settings { DrivesView().environmentObject(model).frame(width: 520).padding() }
             .commands {
                 CommandGroup(after: .appInfo) { Button("Check for Updates…") { model.checkForUpdates(userInitiated: true) } }
+                CommandGroup(after: .textEditing) {
+                    Button("Ask Claude…") { model.showAsk = true }
+                        .keyboardShortcut("k", modifiers: .command)
+                        .disabled(!model.askAvailable)
+                }
             }
     }
 }
@@ -45,7 +51,19 @@ struct OffloadApp: App {
         didSet { UserDefaults.standard.set(catalogsFolder.path, forKey: "lrCatalogsFolder") }
     }
     @Published var catalogMessage: String?
-    @Published private(set) var run: OffloadRun?
+    @Published private(set) var run: OffloadRun? { didSet { runFlag.set(run != nil) } }
+    // Ask Claude (see AskUI.swift)
+    let runFlag = RunFlag()
+    var assistant: AskClaude?
+    @Published var claudeBinary: URL?
+    @Published var showAsk = false
+    @Published var askMessages: [AskMessage] = []
+    @Published var askBusy = false
+    @Published var askStep = ""
+    @Published var askLog = ""
+    @Published var undoSummary: String?
+    @Published var unsharedVersion: String? = UserDefaults.standard.string(forKey: "unsharedVersion")
+    var pendingLocalRestart = false
     @Published var updating = false          // an update is downloading/installing: no new runs
     var pendingUpdate: Release?              // found during a run; offered once it ends (manual mode)
     @Published var stagedUpdate: StagedUpdate?   // downloaded + verified; swapped in on quit
@@ -68,6 +86,7 @@ struct OffloadApp: App {
         refresh()
         AppDelegate.model = self
         startUpdateChecks()
+        refreshAskAvailability()
     }
 
     private func saveRoles() { UserDefaults.standard.set(try? JSONEncoder().encode(roles), forKey: defaultsKey) }
@@ -126,7 +145,7 @@ struct OffloadApp: App {
         verifyProgress = 0; run = r
         Task.detached {
             let rep = body(r)
-            await MainActor.run { self.report = rep; self.run = nil; self.replan(); self.refresh(); self.offerPendingUpdate() }
+            await MainActor.run { self.report = rep; self.run = nil; self.replan(); self.refresh(); self.offerPendingUpdate(); self.runFinished() }
         }
     }
 
@@ -169,6 +188,14 @@ struct ContentView: View {
             if m.stagedUpdate != nil { Section { UpdateFooter() } }
         }
         .formStyle(.grouped)
+        .toolbar {
+            if m.askAvailable {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { m.showAsk = true } label: { Text("✨ Ask") }.help("Ask Claude about Offload (⌘K)")
+                }
+            }
+        }
+        .sheet(isPresented: $m.showAsk) { AskPanel().environmentObject(m) }
     }
 
     @ViewBuilder var cardSection: some View {
@@ -336,6 +363,7 @@ struct DrivesView: View {
                     .foregroundStyle(.secondary)
             }
             LightroomSettingsSection()
+            AskSettingsSection()
             Section("Updates") {
                 Toggle("Automatically download and install updates", isOn: $m.autoUpdate)
                 Text(m.autoUpdate ? "Updates download in the background and install when you quit Offload (never during a copy)."
