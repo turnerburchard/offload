@@ -59,7 +59,7 @@ public struct Release: Decodable, Sendable {
 
 public enum UpdateError: LocalizedError {
     case badResponse(String), noZip, noChecksum, checksumMismatch(expected: String, actual: String)
-    case unzipFailed(String), noApp, wrongBundleID(String?), signatureInvalid(String), signerMismatch(String), notWritable(String), translocated, swapFailed(String)
+    case unzipFailed(String), noApp, wrongBundleID(String?), signatureInvalid(String), signerMismatch(String), notWritable(String), translocated, swapFailed(String), blockedByMacOS
     public var errorDescription: String? {
         switch self {
         case .badResponse(let s): "GitHub request failed: \(s)"
@@ -74,6 +74,7 @@ public enum UpdateError: LocalizedError {
         case .notWritable(let p): "Can't replace the app at \(p) (no write permission). Download the update manually."
         case .translocated: "macOS is running this copy from a temporary location. Move the app to /Applications, open it from there, then update."
         case .swapFailed(let s): "Couldn't swap in the new version (the current version was left in place): \(s)"
+        case .blockedByMacOS: "macOS stopped Offload from updating itself. To allow it, open System Settings → Privacy & Security → App Management and turn on Offload. Your current version still works."
         }
     }
 }
@@ -180,29 +181,37 @@ public enum Updater {
         return app
     }
 
-    /// Swaps `newApp` into `current`'s place. Old bundle is renamed aside first and restored if anything fails.
-    /// `newApp` should be on the same volume (use `workDir(near:)`) so both steps are plain renames.
+    /// Swaps `newApp` into `current`'s place with one atomic rename (RENAME_SWAP): either both bundles trade places
+    /// or nothing changes. Never copies into or deletes from the installed bundle — on macOS 15, App Management can
+    /// block that halfway and leave an empty, unopenable app. `newApp` must be on the same volume (`workDir(near:)`).
+    /// Afterwards the old version sits at `newApp`'s path; it's swapped back if the new one fails codesign, else deleted.
     public static func install(_ newApp: URL, replacing current: URL) throws {
         let fm = FileManager.default
         let parent = current.deletingLastPathComponent()
         if current.path.contains("/AppTranslocation/") { throw UpdateError.translocated }
         guard fm.isWritableFile(atPath: parent.path) else { throw UpdateError.notWritable(parent.path) }
-        let backup = parent.appendingPathComponent(".\(current.lastPathComponent).old-\(UUID().uuidString.prefix(8))")
-        do { try fm.moveItem(at: current, to: backup) } catch { throw UpdateError.swapFailed(error.localizedDescription) }
-        do { try fm.moveItem(at: newApp, to: current) } catch {
-            try? fm.removeItem(at: current)
-            try? fm.moveItem(at: backup, to: current)
-            throw UpdateError.swapFailed(error.localizedDescription)
+        guard fm.fileExists(atPath: newApp.path) else { throw UpdateError.swapFailed("The downloaded update is missing.") }
+        let hadCurrent = fm.fileExists(atPath: current.path)
+        let rc = hadCurrent ? renamex_np(newApp.path, current.path, UInt32(RENAME_SWAP)) : rename(newApp.path, current.path)
+        guard rc == 0 else {
+            let e = errno
+            if e == EPERM || e == EACCES { throw UpdateError.blockedByMacOS }
+            throw UpdateError.swapFailed(String(cString: strerror(e)))
         }
-        try? fm.removeItem(at: backup)
+        let (status, err) = run("/usr/bin/codesign", ["--verify", "--deep", "--strict", current.path])
+        guard status == 0 else {
+            if hadCurrent { _ = renamex_np(newApp.path, current.path, UInt32(RENAME_SWAP)) }
+            throw UpdateError.signatureInvalid(err.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if hadCurrent { try? fm.removeItem(at: newApp) }
     }
 
     /// Install-on-quit: swap in a staged update unless a copy/verify run is in progress.
-    /// Returns true if the new version is now in place. Failures leave the old app intact.
+    /// Returns true if the new version is now in place. Failures leave the old app intact and are reported to `failed`.
     @discardableResult
-    public static func installOnQuit(staged: URL?, appURL: URL, runInProgress: Bool) -> Bool {
+    public static func installOnQuit(staged: URL?, appURL: URL, runInProgress: Bool, failed: (Error) -> Void = { _ in }) -> Bool {
         guard !runInProgress, let staged, FileManager.default.fileExists(atPath: staged.path) else { return false }
-        return (try? install(staged, replacing: appURL)) != nil
+        do { try install(staged, replacing: appURL); return true } catch { failed(error); return false }
     }
 
     /// Temp dir on the same volume as `url`, so the final move is a rename.

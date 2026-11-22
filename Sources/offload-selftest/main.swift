@@ -275,6 +275,33 @@ expectThrow("failed install leaves old app intact") {
     }
     try Updater.install(upd.appendingPathComponent("does-not-exist.app"), replacing: installed)
 }
+// macOS blocking the swap (App Management): simulated with an immutable bundle, which makes rename fail with EPERM.
+func appIsComplete(_ app: URL, _ version: String) -> Bool {
+    NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String == version
+        && shell("/usr/bin/codesign", "--verify", "--deep", "--strict", app.path) == 0
+}
+do {
+    let next = try Updater.prepare(zip: zipApp(makeApp(upd.appendingPathComponent("build-blocked"), id: bundleID, version: "0.3.5"), "blocked.zip"),
+                                   expectedSHA256: try Updater.sha256(of: upd.appendingPathComponent("blocked.zip")), bundleID: bundleID, workDir: work)
+    shell("/usr/bin/chflags", "uchg", installed.path)
+    var blockedErr: Error?, quitErr: Error?
+    do { try Updater.install(next, replacing: installed) } catch { blockedErr = error }
+    let quitInstalled = Updater.installOnQuit(staged: next, appURL: installed, runInProgress: false) { quitErr = $0 }
+    shell("/usr/bin/chflags", "nouchg", installed.path)
+    if case .blockedByMacOS? = blockedErr as? UpdateError { check(true, "blocked swap -> plain 'App Management' error") } else { check(false, "blocked swap error (\(String(describing: blockedErr)))") }
+    check(!quitInstalled && quitErr != nil, "blocked swap on quit: reported, not swallowed")
+    check(appIsComplete(installed, "0.3.0") && fm.fileExists(atPath: next.path), "blocked swap: old app complete and still opens, update untouched")
+} catch { check(false, "blocked swap setup: \(error)") }
+// An update that fails codesign after the swap is swapped straight back out.
+do {
+    let bad = makeApp(upd.appendingPathComponent("build-corrupt-src"), id: bundleID, version: "0.3.6")
+    let staged = work.appendingPathComponent("corrupt/Offload.app")
+    try fm.createDirectory(at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try fm.copyItem(at: bad, to: staged)
+    try Data("tampered".utf8).write(to: staged.appendingPathComponent("Contents/MacOS/Offload"))
+    expectThrow("corrupt update rejected after swap") { try Updater.install(staged, replacing: installed) }
+    check(appIsComplete(installed, "0.3.0"), "corrupt update: old app swapped back, complete")
+} catch { check(false, "corrupt update setup: \(error)") }
 expectThrow("refuses translocated app") { try Updater.install(installed, replacing: URL(fileURLWithPath: "/private/var/folders/x/AppTranslocation/ABC/d/Offload.app")) }
 
 // Install-on-quit staging

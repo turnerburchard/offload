@@ -15,6 +15,10 @@ extension AppModel {
 
     func startUpdateChecks() {
         Task {
+            if let msg = UserDefaults.standard.string(forKey: "updateInstallError") {
+                UserDefaults.standard.removeObject(forKey: "updateInstallError")
+                updateFailed(msg)
+            }
             try? await Task.sleep(for: .seconds(2))
             while !Task.isCancelled {
                 checkForUpdates(userInitiated: false)
@@ -71,14 +75,42 @@ extension AppModel {
     }
 
     /// Called from applicationWillTerminate. Never during a run.
+    /// A failure here can't be shown (we're quitting), so it's saved and explained on next launch.
     func installStagedUpdateOnQuit() {
-        Updater.installOnQuit(staged: stagedUpdate?.app, appURL: Bundle.main.bundleURL, runInProgress: run != nil)
+        Updater.installOnQuit(staged: stagedUpdate?.app, appURL: Bundle.main.bundleURL, runInProgress: run != nil) {
+            UserDefaults.standard.set($0.localizedDescription, forKey: "updateInstallError")
+        }
     }
 
+    /// Swaps now, while still running, so a failure can be shown right away instead of after quitting.
     func restartIntoUpdate() {
-        guard run == nil, stagedUpdate != nil else { return }
-        Updater.relaunch(Bundle.main.bundleURL)   // waits for this process to exit; the swap happens on quit
-        NSApp.terminate(nil)
+        guard run == nil, let s = stagedUpdate else { return }
+        do {
+            try Updater.install(s.app, replacing: Bundle.main.bundleURL)
+            stagedUpdate = nil
+            Updater.relaunch(Bundle.main.bundleURL)
+            NSApp.terminate(nil)
+        } catch {
+            stagedUpdate = nil
+            updateFailed(error.localizedDescription)
+        }
+    }
+
+    /// Plain-English failure, with a shortcut to the App Management setting and the release page.
+    func updateFailed(_ message: String) {
+        let a = NSAlert()
+        a.messageText = "Offload couldn't update itself"
+        a.informativeText = message + "\n\nNothing was changed — this version still works."
+        let blocked = message.contains("App Management")
+        if blocked { a.addButton(withTitle: "Open Settings") }
+        a.addButton(withTitle: "Download from GitHub")
+        a.addButton(withTitle: "OK")
+        let r = a.runModal()
+        if blocked && r == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles")!)
+        } else if r == (blocked ? .alertSecondButtonReturn : .alertFirstButtonReturn) {
+            NSWorkspace.shared.open(URL(string: "https://github.com/\(updateRepo)/releases/latest")!)
+        }
     }
 
     func offerPendingUpdate() {
@@ -113,7 +145,7 @@ extension AppModel {
                 NSApp.terminate(nil)
             } catch {
                 updating = false
-                alert("Update failed", error.localizedDescription + "\n\nThe current version was left in place.")
+                updateFailed(error.localizedDescription)
             }
         }
     }
