@@ -74,6 +74,18 @@ extension AppModel {
         Task.detached { let r = a.send(text); await MainActor.run { self.handle(r) } }
     }
 
+    /// The Yes/No buttons: permission to touch safety code (NEEDS_OK), or "Install it anyway?".
+    func askAnswer(_ yes: Bool) {
+        guard !askBusy, let a = assistant, a.awaitingOK || a.awaitingInstallOK else { return }
+        let installing = a.awaitingInstallOK
+        askMessages.append(AskMessage(who: .user, text: yes ? (installing ? "Yes, install it." : "Yes, go ahead.") : "No, don't."))
+        askBusy = true; askStep = installing ? "Saving…" : "Getting started…"
+        Task.detached {
+            let r = installing ? a.confirmInstall(yes) : a.answerPermission(yes)
+            await MainActor.run { self.handle(r) }
+        }
+    }
+
     func askUndo() {
         guard !askBusy, let a = makeAssistant(), let s = undoSummary else { return }
         askMessages.append(AskMessage(who: .user, text: "Undo “\(s)”"))
@@ -84,7 +96,7 @@ extension AppModel {
     private func handle(_ r: AskClaude.Result) {
         askBusy = false; askStep = ""
         switch r {
-        case .answer(let t), .needsOK(let t), .failed(let t), .refused(let t):
+        case .answer(let t), .needsOK(let t), .failed(let t), .refused(let t), .confirmInstall(let t):
             askMessages.append(AskMessage(who: .claude, text: t))
         case .built(let version, _, let message):
             askMessages.append(AskMessage(who: .claude, text: message.isEmpty ? "Done!" : message))
@@ -93,7 +105,7 @@ extension AppModel {
         refreshUndo()
     }
 
-    var askAwaitingOK: Bool { assistant?.awaitingOK ?? false }
+    var askAwaitingOK: Bool { (assistant?.awaitingOK ?? false) || (assistant?.awaitingInstallOK ?? false) }
 
     func refreshUndo() {
         guard let a = makeAssistant() else { undoSummary = nil; return }
@@ -170,7 +182,7 @@ struct AskPanel: View {
             HStack {
                 Text("✨ Ask about Offload").font(.headline)
                 Spacer()
-                if let s = m.undoSummary, !m.askBusy {
+                if let s = m.undoSummary, !m.askBusy, !m.askAwaitingOK {
                     Button("Undo “\(s)”") { m.askUndo() }.controlSize(.small)
                 }
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
@@ -204,16 +216,16 @@ struct AskPanel: View {
             }
             if m.askAwaitingOK && !m.askBusy {
                 HStack {
-                    Button("Yes, go ahead") { m.askSend("Yes, go ahead.") }
-                    Button("No, don't") { m.askSend("No, don't do that.") }
+                    Button("Yes") { m.askAnswer(true) }
+                    Button("No") { m.askAnswer(false) }
                     Spacer()
                 }.padding(.horizontal, 12).padding(.top, 6)
             }
             HStack {
                 TextField("Ask a question…", text: $draft).textFieldStyle(.roundedBorder)
                     .onSubmit { send() }
-                    .disabled(m.askBusy)
-                Button("Send") { send() }.disabled(m.askBusy || draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(m.askBusy || m.askAwaitingOK)
+                Button("Send") { send() }.disabled(m.askBusy || m.askAwaitingOK || draft.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding(12)
             DisclosureGroup("Show details", isExpanded: $showDetails) {

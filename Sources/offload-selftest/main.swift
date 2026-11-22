@@ -390,17 +390,28 @@ if AskEnvironment.isSourceCheckout(srcRepo) {
       break) echo "broken $n" >> README.md; touch BREAK; emit "Offload now shows a smiley.\\n<<DONE>>" ;;
       giveup) echo "half $n" >> README.md; emit "I couldn't make that work.\\n<<FAILED>>" ;;
       nochange) emit "All done.\\n<<DONE>>" ;;
+      guarded) echo "// tweak $n" >> Sources/OffloadCore/Engine.swift; emit "Offload is a bit faster.\\n<<DONE>>" ;;
+      newfile) mkdir -p .github/workflows; echo "on: push" > .github/workflows/extra-$n.yml; emit "Added a helper.\\n<<DONE>>" ;;
+      removecheck) awk 'BEGIN{d=0} /check\\(/ && !d {d=1; next} {print}' Sources/offload-selftest/main.swift > t.swift && mv t.swift Sources/offload-selftest/main.swift; emit "Tidied up.\\n<<DONE>>" ;;
+      addcheck) printf 'check(true, "new check %s")\\n' $n >> Sources/offload-selftest/main.swift; echo "extra $n" >> README.md; emit "Offload now has a new trick.\\n<<DONE>>" ;;
       needsok)
         case "$prompt" in
           *"No, don"*) emit "Okay, I won't change it.\\n<<FAILED>>" ;;
-          *"Yes, go ahead"*) echo "safety $n" >> README.md; emit "Offload now double-checks twice.\\n<<DONE>>" ;;
+          *"Yes, go ahead"*) echo "safety $n" >> README.md; echo "// safety $n" >> Sources/OffloadCore/Engine.swift; emit "Offload now double-checks twice.\\n<<DONE>>" ;;
           *) emit "This changes how Offload checks your files, which could affect safety. Is that OK?\\n<<NEEDS_OK>>" ;;
         esac ;;
     esac
     """.write(to: fakeClaude, atomically: true, encoding: .utf8)
     let fakeBuild = fake.appendingPathComponent("build.sh"), fakeTest = fake.appendingPathComponent("selftest.sh")
     try! "#!/bin/sh\necho building\nexit 0\n".write(to: fakeBuild, atomically: true, encoding: .utf8)
-    try! "#!/bin/sh\nif [ -e BREAK ]; then echo '1 FAILED'; exit 1; fi\necho 'ALL PASSED'\n".write(to: fakeTest, atomically: true, encoding: .utf8)
+    // Prints as many PASS lines as fake/passes says (default 5), so a drop in checks can be simulated.
+    try! """
+    #!/bin/sh
+    if [ -e BREAK ]; then echo '1 FAILED'; exit 1; fi
+    n=$(cat "\(fake.path)/passes" 2>/dev/null || echo 5)
+    i=0; while [ $i -lt $n ]; do echo "PASS fake $i"; i=$((i+1)); done
+    echo 'ALL PASSED'
+    """.write(to: fakeTest, atomically: true, encoding: .utf8)
     for f in [fakeClaude, fakeBuild, fakeTest] { try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: f.path) }
     func scenario(_ s: String) { try! s.write(to: fake.appendingPathComponent("scenario"), atomically: true, encoding: .utf8) }
     func calls() -> [String] {
@@ -414,6 +425,7 @@ if AskEnvironment.isSourceCheckout(srcRepo) {
 
     var cfg = AskClaude.Config(repo: clone, claude: ClaudeCLI(binary: fakeClaude))
     cfg.buildCommand = [fakeBuild.path]; cfg.testCommand = [fakeTest.path]
+    cfg.passCountStore = ask.appendingPathComponent("pass-counts.json")
     var copying = false
     cfg.isRunInProgress = { copying }
     let a = AskClaude(cfg)
@@ -470,13 +482,13 @@ if AskEnvironment.isSourceCheckout(srcRepo) {
     scenario("needsok")
     let r4 = a.send("Yes, check files twice")
     if case .needsOK(let q) = r4 { check(q.contains("Is that OK?") && a.awaitingOK && head() == h2 && clean(), "NEEDS_OK: asks first, nothing changed") } else { check(false, "NEEDS_OK (\(r4))") }
-    let r4n = a.send("No, don't do that.")
+    let r4n = a.answerPermission(false)
     check(r4n == .failed("Okay, I won't change it.") && !a.awaitingOK && head() == h2, "NEEDS_OK + no: nothing changed")
     _ = a.send("Yes, check files twice")
-    let r4y = a.send("Yes, go ahead.")
+    let r4y = a.answerPermission(true)
     let v2 = AskClaude.bumpPatch(v1) ?? "?"
     check(r4y == .built(version: v2, summary: "show a smiley", message: "Offload now double-checks twice."), "NEEDS_OK + yes: built \(v2) (\(r4y))")
-    check(version() == v2, "NEEDS_OK + yes: version \(v2)")
+    check(version() == v2 && !a.awaitingInstallOK, "NEEDS_OK + yes: safety-code change installed without asking again (\(v2))")
 
     // 5. Undo: reverts the last change as a new version.
     let readmeBefore = (try? String(contentsOf: clone.appendingPathComponent("README.md"), encoding: .utf8)) ?? ""
@@ -486,6 +498,47 @@ if AskEnvironment.isSourceCheckout(srcRepo) {
     check(r5 == .built(version: v3, summary: "show a smiley", message: "Undid “show a smiley”."), "undo: built \(v3) (\(r5))")
     check(readmeBefore.contains("safety") && !readmeAfter.contains("safety") && readmeAfter.contains("smiley"), "undo: only the last change reverted")
     check(version() == v3 && git("log", "-1", "--format=%s").1.hasPrefix("Undo Ask Claude:") && a.lastChangeSummary() == nil, "undo: version \(v3), undo commit, no second undo")
+    check(!(((try? String(contentsOf: clone.appendingPathComponent("Sources/OffloadCore/Engine.swift"), encoding: .utf8)) ?? "").contains("// safety")), "undo of a safety change needs no extra OK (restores the old code exactly)")
+
+    // 5b. The app's own safety guard (not just the prompt).
+    check(AskClaude.touchesSafety(names: ["Sources/Updater/Updater.swift"], selftestDiff: "") && AskClaude.touchesSafety(names: ["build.sh"], selftestDiff: "")
+          && AskClaude.touchesSafety(names: [".github/workflows/x.yml"], selftestDiff: "") && AskClaude.touchesSafety(names: ["Package.swift"], selftestDiff: "")
+          && AskClaude.touchesSafety(names: ["Sources/OffloadCore/Card.swift"], selftestDiff: ""), "guarded files recognized")
+    check(!AskClaude.touchesSafety(names: ["Sources/Offload/OffloadApp.swift", "Sources/offload-selftest/main.swift"], selftestDiff: "--- a/x\n+++ b/x\n+check(true, \"new\")"), "new checks + app UI aren't guarded")
+    check(AskClaude.touchesSafety(names: ["Sources/offload-selftest/main.swift"], selftestDiff: "--- a/x\n+++ b/x\n-check(a, \"old\")\n+check(true, \"old\")"), "edited check line is guarded")
+    check(AskClaude.passCount("PASS a\nFAIL b\nPASS c\nxPASS\n") == 2, "PASS lines counted")
+    var v = version(), h = head()
+    func expectConfirm(_ scen: String, _ what: String) {
+        scenario(scen)
+        let r = a.send("Yes, do it")
+        check(r == .confirmInstall("This change touches how Offload checks your photos are safe. Install it anyway?") && a.awaitingInstallOK && head() == h, "\(what): asks before installing (\(r))")
+        check(a.send("yes") == .needsOK("This change touches how Offload checks your photos are safe. Install it anyway?") && head() == h, "\(what): typing doesn't bypass the question")
+    }
+    expectConfirm("guarded", "guarded file changed")
+    let st1 = stashes()
+    check(a.confirmInstall(false) == .failed("Okay, I didn't install it. Offload stays as it was.") && head() == h && version() == v && clean() && stashes() == st1 + 1, "guarded + No: stashed, version unchanged")
+    expectConfirm("guarded", "guarded file changed (again)")
+    let rYes = a.confirmInstall(true)
+    if case .built(let nv, _, _) = rYes { check(nv == AskClaude.bumpPatch(v) && version() == nv && clean(), "guarded + Yes: installed \(nv)") } else { check(false, "guarded + Yes (\(rYes))") }
+    v = version(); h = head()
+    expectConfirm("newfile", "new file under .github")
+    _ = a.confirmInstall(false)
+    expectConfirm("removecheck", "removed check line")
+    _ = a.confirmInstall(false)
+    check(head() == h && version() == v && clean(), "declined changes left nothing behind")
+    scenario("addcheck")
+    let rAdd = a.send("Yes, add a trick")
+    if case .built(let nv, _, _) = rAdd { check(nv == AskClaude.bumpPatch(v) && !a.awaitingInstallOK, "only new checks + non-guarded file: installs automatically (\(nv))") } else { check(false, "addcheck (\(rAdd))") }
+    v = version(); h = head()
+    try! "3".write(to: fake.appendingPathComponent("passes"), atomically: true, encoding: .utf8)
+    scenario("success")
+    let rDrop = a.send("Yes, add confetti")
+    check(rDrop == .failed("Some of Offload's safety checks went missing, so I put everything back the way it was.") && head() == h && version() == v && clean(), "fewer PASS lines than last build: refused, stashed")
+    try! "6".write(to: fake.appendingPathComponent("passes"), atomically: true, encoding: .utf8)
+    let rMore = a.send("Yes, add confetti")
+    if case .built = rMore { check(true, "more PASS lines: accepted") } else { check(false, "more PASS lines (\(rMore))") }
+    let stored = (try? JSONDecoder().decode([String: Int].self, from: Data(contentsOf: ask.appendingPathComponent("pass-counts.json")))) ?? [:]
+    check(stored["latest"] == 6 && stored[head()] == 6, "pass count saved outside the repo")
 
     // 6. Refuses during a copy/verify run.
     copying = true

@@ -163,6 +163,7 @@ public final class AskClaude: @unchecked Sendable {
         case built(version: String, summary: String, message: String)
         case failed(String)
         case refused(String)
+        case confirmInstall(String)                              // built + tested, but touches safety code: ask before installing
     }
 
     public struct Config: @unchecked Sendable {
@@ -172,6 +173,9 @@ public final class AskClaude: @unchecked Sendable {
         public var testCommand = [".build/release/offload-selftest"]
         public var remote = "origin"
         public var isRunInProgress: () -> Bool = { false }
+        /// Self-test PASS counts per commit, outside the repo so Claude's edits can't touch it.
+        public var passCountStore = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Offload/ask-pass-counts.json")
         public init(repo: URL, claude: ClaudeCLI) { self.repo = repo; self.claude = claude }
     }
 
@@ -181,6 +185,11 @@ public final class AskClaude: @unchecked Sendable {
     public var onMessage: (String) -> Void = { _ in }         // intermediate bubbles ("Great, I'll add that now.")
     public private(set) var sessionID: String?
     public private(set) var awaitingOK = false
+    /// A built + tested change that touches safety code, waiting for "Install it anyway?".
+    public private(set) var awaitingInstallOK = false
+    /// The user pressed "Yes, go ahead" in the NEEDS_OK flow for the current build (reset per build).
+    private var approvedRisky = false
+    private var pendingInstall: (summary: String, message: String, version: String, commitMessage: String)?
     private var lastQuestion: String?
     private var pendingSummary: String?
 
@@ -209,6 +218,7 @@ public final class AskClaude: @unchecked Sendable {
 
     /// Blocking. Call off the main thread.
     public func send(_ text: String) -> Result {
+        if awaitingInstallOK { return .needsOK(Self.riskyQuestion) }
         if awaitingOK { return build(prompt: text, continuing: true) }
         onStep("Thinking…")
         let o = config.claude.run(text, mode: .ask, session: sessionID, systemPrompt: Self.askPrompt, cwd: config.repo, onStep: onStep, onLog: onLog)
@@ -221,9 +231,18 @@ public final class AskClaude: @unchecked Sendable {
         return build(prompt: "The user said: \"\(text)\". Go ahead and build it now.", continuing: false)
     }
 
+    /// The explicit answer to a NEEDS_OK question (the UI's Yes/No buttons). Only this counts as permission
+    /// to change safety code; a typed reply goes to Claude but doesn't set the flag.
+    public func answerPermission(_ yes: Bool) -> Result {
+        guard awaitingOK else { return .failed("There's nothing waiting for an answer.") }
+        if yes { approvedRisky = true }
+        return build(prompt: yes ? "Yes, go ahead." : "No, don't do that.", continuing: true)
+    }
+
     func build(prompt: String, continuing: Bool) -> Result {
         if config.isRunInProgress() { return .refused("A copy is running. Ask me again when it's finished.") }
         if !continuing && !status().isEmpty { return .failed("Offload's source folder has unsaved changes, so I can't change it right now.") }
+        if !continuing { approvedRisky = false }
         awaitingOK = false
         onStep("Getting started…")
         let o = config.claude.run(prompt, mode: .build, session: sessionID, systemPrompt: Self.buildPrompt, cwd: config.repo, onStep: onStep, onLog: onLog)
@@ -241,8 +260,10 @@ public final class AskClaude: @unchecked Sendable {
         }
     }
 
+    static let riskyQuestion = "This change touches how Offload checks your photos are safe. Install it anyway?"
+
     /// The app's own check — Claude saying "done" isn't enough.
-    func verifyAndCommit(summary: String, message: String, commitMessage: String? = nil) -> Result {
+    func verifyAndCommit(summary: String, message: String, commitMessage: String? = nil, isUndo: Bool = false) -> Result {
         onStep("Double-checking everything still works…")
         guard !status().isEmpty else { discard(); return .failed("I didn't end up changing anything.") }
         guard let current = currentVersion(), let next = Self.bumpPatch(current) else { discard(); return .failed("Sorry, something went wrong. Nothing was changed.") }
@@ -252,18 +273,91 @@ public final class AskClaude: @unchecked Sendable {
         onStep("Testing…")
         let (ts, tout) = shell(config.testCommand)
         guard ts == 0, tout.contains("ALL PASSED") else { discard(); return .failed("The change didn't pass Offload's safety checks, so I put everything back the way it was.") }
+        // Tests can't quietly disappear: at least as many checks must pass as at the baseline commit.
+        let passes = Self.passCount(tout)
+        let head = git(["rev-parse", "HEAD"]).1.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseline = isUndo ? passCounts()[git(["rev-parse", "HEAD^"]).1.trimmingCharacters(in: .whitespacesAndNewlines)]
+                              : passCounts()[head] ?? passCounts()["latest"]
+        if let baseline, passes < baseline {
+            discard(); return .failed("Some of Offload's safety checks went missing, so I put everything back the way it was.")
+        }
+        git(["add", "-A"])
+        let pending = (summary: summary, message: message, version: next, commitMessage: commitMessage ?? "Ask Claude: \(summary)")
+        lastPassCount = passes
+        // Safety code changed, or existing checks removed/edited: the user decides, unless they already said yes.
+        let risky = isUndo ? !undoRestoresParent() : Self.touchesSafety(names: stagedNames(), selftestDiff: stagedSelftestDiff())
+        if risky && !approvedRisky {
+            pendingInstall = pending; awaitingInstallOK = true
+            return .confirmInstall(Self.riskyQuestion)
+        }
+        return commit(pending)
+    }
+
+    /// "Install it anyway?" — yes commits; no puts the change aside like any failure.
+    public func confirmInstall(_ yes: Bool) -> Result {
+        guard awaitingInstallOK, let p = pendingInstall else { return .failed("There's nothing waiting to be installed.") }
+        awaitingInstallOK = false; pendingInstall = nil
+        guard yes else { discard(); return .failed("Okay, I didn't install it. Offload stays as it was.") }
+        return commit(p)
+    }
+
+    private var lastPassCount = 0
+
+    private func commit(_ p: (summary: String, message: String, version: String, commitMessage: String)) -> Result {
         onStep("Saving…")
         git(["add", "-A"])
-        guard git(["commit", "-q", "-m", commitMessage ?? "Ask Claude: \(summary)"]).0 == 0, git(["tag", "v\(next)"]).0 == 0 else {
+        guard git(["commit", "-q", "-m", p.commitMessage]).0 == 0, git(["tag", "v\(p.version)"]).0 == 0 else {
             discard(); return .failed("Sorry, I couldn't save the change. Nothing was changed.")
         }
-        pendingSummary = nil
-        return .built(version: next, summary: summary, message: message)
+        var counts = passCounts()
+        counts[git(["rev-parse", "HEAD"]).1.trimmingCharacters(in: .whitespacesAndNewlines)] = lastPassCount
+        counts["latest"] = lastPassCount
+        savePassCounts(counts)
+        pendingSummary = nil; approvedRisky = false
+        return .built(version: p.version, summary: p.summary, message: p.message)
+    }
+
+    // MARK: Safety guard
+
+    static let guardedFiles: Set<String> = ["Sources/OffloadCore/Engine.swift", "Sources/OffloadCore/Card.swift", "build.sh", "Package.swift"]
+    static let guardedPrefixes = ["Sources/Updater/", ".github/"]
+    static let selftestPath = "Sources/offload-selftest/main.swift"
+
+    /// True if the change touches safety-critical files, or removes/edits an existing `check(` line in the self-test
+    /// (adding new checks is fine). `names`: changed paths (renames as delete + add). `selftestDiff`: unified diff of the self-test.
+    public static func touchesSafety(names: [String], selftestDiff: String) -> Bool {
+        if names.contains(where: { n in guardedFiles.contains(n) || guardedPrefixes.contains { n.hasPrefix($0) } }) { return true }
+        return selftestDiff.split(separator: "\n").contains { l in l.hasPrefix("-") && !l.hasPrefix("---") && l.contains("check(") }
+    }
+
+    public static func passCount(_ output: String) -> Int {
+        output.split(separator: "\n").filter { $0.hasPrefix("PASS ") || $0 == "PASS" }.count
+    }
+
+    func stagedNames() -> [String] {
+        git(["diff", "--cached", "--name-only", "--no-renames", "HEAD"]).1.split(separator: "\n").map(String.init)
+    }
+    func stagedSelftestDiff() -> String {
+        git(["diff", "--cached", "--no-renames", "-U0", "HEAD", "--", Self.selftestPath]).1
+    }
+    /// An undo is only trusted if it puts every file (except VERSION) back exactly as it was before the change.
+    func undoRestoresParent() -> Bool {
+        let diff = git(["diff", "--cached", "--name-only", "HEAD^"]).1.split(separator: "\n").map(String.init)
+        return diff.allSatisfy { $0 == "VERSION" }
+    }
+
+    func passCounts() -> [String: Int] {
+        guard let d = try? Data(contentsOf: config.passCountStore) else { return [:] }
+        return (try? JSONDecoder().decode([String: Int].self, from: d)) ?? [:]
+    }
+    func savePassCounts(_ c: [String: Int]) {
+        try? FileManager.default.createDirectory(at: config.passCountStore.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(c).write(to: config.passCountStore, options: .atomic)
     }
 
     /// Never loses anything: failed changes go to a git stash, not the bin.
     func discard() {
-        awaitingOK = false
+        awaitingOK = false; awaitingInstallOK = false; pendingInstall = nil; approvedRisky = false
         guard !status().isEmpty else { return }
         git(["stash", "push", "-u", "-m", "ask-claude-failed-\(Int(Date().timeIntervalSince1970))"])
     }
@@ -277,6 +371,7 @@ public final class AskClaude: @unchecked Sendable {
     }
 
     public func undoLastChange() -> Result {
+        if awaitingOK || awaitingInstallOK { return .failed("Please answer the question above first.") }
         if config.isRunInProgress() { return .refused("A copy is running. Try again when it's finished.") }
         guard let summary = lastChangeSummary() else { return .failed("There's nothing to undo.") }
         guard status().isEmpty else { return .failed("Offload's source folder has unsaved changes, so I can't undo right now.") }
@@ -284,7 +379,7 @@ public final class AskClaude: @unchecked Sendable {
         onStep("Undoing…")
         guard git(["revert", "--no-commit", "HEAD"]).0 == 0 else { git(["revert", "--abort"]); return .failed("Sorry, I couldn't undo that.") }
         try? (current + "\n").write(to: config.repo.appendingPathComponent("VERSION"), atomically: true, encoding: .utf8)   // bumped below
-        let r = verifyAndCommit(summary: summary, message: "Undid “\(summary)”.", commitMessage: "Undo Ask Claude: \(summary)")
+        let r = verifyAndCommit(summary: summary, message: "Undid “\(summary)”.", commitMessage: "Undo Ask Claude: \(summary)", isUndo: true)
         if case .failed = r { return .failed("Sorry, I couldn't undo that. Nothing was changed.") }
         return r
     }
